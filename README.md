@@ -69,11 +69,15 @@ quantize/
 
 ### Hardware Requirements
 
+Measured from actual training runs (teacher + student + optimizer + gradients + activations):
+
 | Model | Config | Total VRAM | Example GPU |
 |---|---|---|---|
-| Qwen3.5-2B | BF16 teacher + student | ~10 GB | Any modern GPU |
+| Qwen3.5-2B | BF16 teacher + student | ~40 GB | A40 48GB |
 | Qwen3-8B | 4-bit teacher + BF16 student | ~78 GB | A100 80GB or 2x48GB |
 | Qwen3.5-35B | 4-bit teacher + BF16 student | ~380 GB | 8x A100 80GB |
+
+**Note:** 24GB GPUs (RTX 3090/4090) cannot fit even the 2B model due to optimizer states and activations.
 
 ---
 
