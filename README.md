@@ -6,18 +6,24 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 
 ## Status
 
-**Work in progress.** Training pipeline is functional — loss converges, logit distributions align — but generation quality is not yet at Bonsai levels. See [Findings](#findings) below.
+**Active development.** Multiple quantization approaches tested. Current approach (v4.2) uses progressive quantization + scheduled sampling + MSE distillation. The model generates contextually relevant English at 1-bit ("The sun is a warm" for sky-related prompts) and scores 12% on simple QA with repetition penalty. Full training run (3000 steps) in progress with CE stabilized at ~0.68 at noise=0.87 — much better than prior attempts. See [Findings](#findings) below.
 
 ## Quick Start — Training
 
 ```bash
 # Install dependencies
-pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
+pip install torch transformers datasets accelerate sentencepiece protobuf huggingface-hub
 
-# Local training (Qwen3.5-2B, fits on any 40GB+ GPU)
-PYTHONUNBUFFERED=1 python quantize/run.py
+# Current approach: v4.2 (progressive quant + scheduled sampling)
+PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3.5-2B
 
-# Cloud training (Qwen3-8B, auto-detects multi-GPU + VRAM)
+# Quick validation (300 steps, ~2 hours)
+PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3.5-2B --max-steps 300
+
+# 8B model (needs A100 80GB+)
+PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3-8B --use-4bit-teacher
+
+# Legacy approaches (for reference)
 PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B
 ```
 
@@ -44,23 +50,28 @@ w_i = scale * (2 * bit_i - 1)    bit_i in {0, 1}
 
 Effective: 1.125 bits/weight. A Qwen3-8B model compresses from 16.4 GB to ~1.15 GB.
 
-### Training Approach
+### Training Approach (v4.2 — Current)
 
 | Component | Technique |
 |---|---|
-| Quantization | STE (straight-through estimator) with binary {-d, +d} weights |
-| Scales | Learned per group of 128 (LSQ-style, optimized via backprop) |
-| Distillation | Normalized logit MSE + cosine similarity (NOT KL — it explodes at 1-bit) |
-| Teacher | Frozen copy of the base model (4-bit via bitsandbytes for memory efficiency) |
+| Quantization | STE (straight-through estimator) with binary {-d, +d} weights via `ProgressiveQuantizedLinear` |
+| Noise schedule | AggressiveQuantizer: start noise=0.5, ramp to 1.0 by 20% of steps, full 1-bit for 80% |
+| Scales | Learned per group of 128 (log_scale parameters, 10x LR multiplier) |
+| Distillation | Normalized logit MSE (0.4) + cosine similarity (0.2) + CE (0.4). NOT KL — it explodes at 1-bit |
+| Scheduled sampling | Mix student's own predictions into training inputs (10%→30%) to fix exposure bias |
+| Teacher | Frozen BF16 copy (or 4-bit via bitsandbytes for 8B models) |
 | Skipped layers | Embedding + LM head kept in FP16 (critical for generation) |
+| Eval | Repetition penalty 1.3 to counter word-doubling artifact |
 
 ### Key Files
 
 ```
 quantize/
-├── run.py            # Local training (single GPU, validated on 2B)
-├── run_cloud.py      # Cloud training (multi-GPU, auto-detects hardware)
-├── quantize_lib.py   # Core: STE quantizer, BitLinear, learned scales
+├── run_v4.py         # Current: QAT v4.2 (progressive quant + scheduled sampling + MSE)
+├── gptq_1bit.py      # GPTQ 1-bit PTQ (proven insufficient, useful for analysis)
+├── run.py            # Legacy: local training with SubLN + dynamic scales
+├── run_cloud.py      # Legacy: cloud training (multi-GPU, 4-bit teacher)
+├── quantize_lib.py   # Core: ProgressiveQuantizedLinear, STE, Hadamard, learned scales
 ├── auto_tune.py      # Hyperparameter search loop
 ├── evaluate.py       # Benchmark evaluation
 ├── export_gguf.py    # Export to Q1_0_g128 GGUF format
@@ -83,26 +94,52 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 
 ## Findings
 
+### Approach Evolution & Results
+
+| Approach | Score | Generation Output | Key Issue |
+|----------|-------|-------------------|-----------|
+| GPTQ PTQ (gptq_1bit.py) | 0% | "FGFG" random garbage | PTQ fundamentally insufficient at 1-bit |
+| QAT v1-v3 (run_cloud.py, run.py) | 0% | `\n\n\n` empty | Exposure bias from teacher forcing |
+| QAT v4.0 (top-K KL loss) | 0% | English words ("the", "higher") | KL clamped at 50, drowned CE signal |
+| QAT v4.1 (MSE+cos, 1000 steps) | 0% | Contextual sentences ("The sun is a warm") | Only 300 steps at full 1-bit |
+| QAT v4.2 baseline (untrained + rep penalty) | 12% | 1/8 correct | Word doubling hid correct answers |
+| QAT v4.2 (3000 steps, in progress) | TBD | CE=0.68 at noise=0.87 | Best trajectory yet |
+
+### Key Discoveries
+
+1. **PTQ cannot handle 1-bit** — GPTQ with Hessian compensation, Hadamard rotation, and sign-flip refinement all fail. Error compounds catastrophically through layers (dead after 5/36 layers). Confirmed on both Qwen3.5-2B and Qwen3-8B.
+
+2. **KL divergence explodes at 1-bit** — over 151k vocab, KL goes to 3600+. Even top-K KL (K=128) clamped at 50 permanently. Use normalized MSE + cosine instead.
+
+3. **Teacher forcing causes generation collapse** — model learns perfect next-token prediction (CE→0.003) but outputs `\n\n` during generation because it never sees its own errors. Fix: scheduled sampling (mix student predictions into training inputs).
+
+4. **Progressive quantization prevents initialization shock** — jumping straight to 1-bit destroys the model. Annealing noise from 0.5→1.0 lets the model adapt gradually. CE stays 2x lower than non-progressive at same noise levels.
+
+5. **Word doubling at 1-bit** — the model generates every word twice ("TheThe", "is is", "world world"). Adding repetition_penalty=1.3 reveals the model actually has correct knowledge hidden behind the doubling pattern.
+
+6. **Most training time should be at full 1-bit** — v4.1 wasted 700/1000 steps on noise 0.0-0.9. v4.2 starts at noise=0.5 and reaches 1.0 by 20% of steps, giving 80% of training at full 1-bit.
+
 ### What Works
-- Loss converges: CE drops from 10+ to <0.01, cosine distance from 0.8 to 0.35
-- Training moves correct answers up in logit ranking (e.g., "Paris" from rank 134k to 18k)
-- Normalized MSE + cosine distillation is stable (KL divergence explodes at 1-bit over large vocabs)
-- 2B model trains in ~4 hours on NVIDIA DIGITS (GB10, 128GB unified memory)
+- Progressive quantization (noise annealing from 0.5→1.0) keeps CE stable
+- Normalized MSE + cosine + CE distillation is stable and effective
+- Scheduled sampling (10-30% of tokens replaced with student predictions)
+- Learned per-group scales with 10x LR multiplier
+- Repetition penalty 1.3 in eval reveals hidden knowledge
+- Model generates contextually relevant English at full 1-bit after v4.1+
 
 ### What Doesn't Work Yet
-- Generation produces empty output even after training loss converges
-- The model learns next-token prediction (teacher forcing) but fails at autoregressive generation
-- "Paris" reaches rank 18,016 but needs to reach rank 1 out of 151,669 tokens
+- Generation accuracy: 0% without repetition penalty, 12% with (untrained baseline)
+- Word doubling artifact not fully solved
+- Need more training steps at full 1-bit (v4.2 in progress with 2400 steps at noise=1.0)
 
 ### Why This Is Hard
-PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published. Our public approach (STE + distillation) is the best-known method but likely missing key ingredients.
+PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.
 
-### Techniques From Literature Not Yet Implemented
-1. Ternary {-1, 0, +1} quantization (BitNet b1.58) — more expressive but Bonsai proves binary works
-2. Confidence-aware KL divergence (BitDistiller) — adapt distillation per sample
-3. Attention-level distillation — match attention maps, not just output logits
-4. Hadamard rotation (QuIP#) — spread weight outliers before binarization
-5. Hessian-based compensation (OBS/GPTQ) — second-order weight correction
+### Potential Next Steps (if v4.2 plateaus)
+1. Try Qwen3-8B (standard transformer, more redundant — what PrismML actually used) on A100 80GB
+2. Ternary {-1, 0, +1} quantization (BitNet b1.58) — more expressive
+3. Start from v4.1/v4.2 checkpoint instead of fresh weights
+4. Attention-level distillation — match attention maps, not just output logits
 
 ---
 

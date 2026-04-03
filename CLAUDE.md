@@ -151,4 +151,4 @@ Uses `ProgressiveQuantizedLinear` from `quantize_lib.py` with learned `log_scale
 | QAT v4.0 (top-K KL) | 2B | 0% | English words but KL drowned CE |
 | QAT v4.1 (MSE+cos, 1000 steps) | 2B | 0% | "The sun is a warm" — contextual! |
 | QAT v4.2 baseline (untrained + rep penalty) | 2B | 12% | 1/8 correct answers |
-| QAT v4.2 (training in progress) | 2B | TBD | CE: 9.3→0.03 in 150 steps |
+| QAT v4.2 (3000 steps, in progress) | 2B | TBD | CE: 9.3→0.03→0.68 stable at noise=0.87 |
