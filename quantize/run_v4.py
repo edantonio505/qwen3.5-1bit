@@ -266,7 +266,8 @@ def generate_answer(model, tokenizer, prompt, max_tokens=60):
     inp = tokenizer(text, return_tensors="pt").to(device)
     with torch.no_grad():
         out = model.generate(**inp, max_new_tokens=max_tokens, do_sample=False,
-                             repetition_penalty=1.3,
+                             repetition_penalty=2.0,
+                             no_repeat_ngram_size=3,
                              pad_token_id=tokenizer.pad_token_id)
     new_ids = out[0][inp["input_ids"].shape[1]:]
     clean = tokenizer.decode(new_ids, skip_special_tokens=True).strip()

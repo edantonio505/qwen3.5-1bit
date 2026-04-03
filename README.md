@@ -103,11 +103,14 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 | QAT v4.0 (top-K KL loss) | 0% | English words ("the", "higher") | KL clamped at 50, drowned CE signal |
 | QAT v4.1 (MSE+cos, 1000 steps) | 0% | Contextual sentences ("The sun is a warm") | Only 300 steps at full 1-bit |
 | QAT v4.2 baseline (untrained + rep penalty) | 12% | 1/8 correct | Word doubling hid correct answers |
-| QAT v4.2 (3000 steps, in progress) | TBD | CE=0.68 at noise=0.87 | Best trajectory yet |
+| QAT v4.2 on Qwen3.5-2B (killed step 525) | 12% | CE=0.73 at noise=0.94 | Hybrid architecture is a blocker |
+| QAT v4.2 on Qwen3-1.7B (in progress) | TBD | Standard transformer, 6x faster | Architecture matches PrismML's choice |
 
 ### Key Discoveries
 
-1. **PTQ cannot handle 1-bit** — GPTQ with Hessian compensation, Hadamard rotation, and sign-flip refinement all fail. Error compounds catastrophically through layers (dead after 5/36 layers). Confirmed on both Qwen3.5-2B and Qwen3-8B.
+1. **Use standard transformers, not hybrid architectures** — Qwen3.5-2B (GatedDeltaNet hybrid) is fundamentally harder to quantize than Qwen3-1.7B/8B (standard transformer). The recurrent state in linear attention compounds quantization errors. PrismML chose standard transformer deliberately. Training is 6x faster on standard transformers.
+
+2. **PTQ cannot handle 1-bit** — GPTQ with Hessian compensation, Hadamard rotation, and sign-flip refinement all fail. Error compounds catastrophically through layers (dead after 5/36 layers). Confirmed on both Qwen3.5-2B and Qwen3-8B.
 
 2. **KL divergence explodes at 1-bit** — over 151k vocab, KL goes to 3600+. Even top-K KL (K=128) clamped at 50 permanently. Use normalized MSE + cosine instead.
 

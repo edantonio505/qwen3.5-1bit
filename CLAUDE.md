@@ -74,6 +74,11 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 
 ### What We Learned (Critical Knowledge)
 
+**Use standard transformers (Qwen3), NOT hybrid (Qwen3.5):**
+- Qwen3.5-2B uses GatedDeltaNet (75% linear attention with recurrent state) — fundamentally harder to quantize. Recurrent state compounds errors through time.
+- Qwen3-1.7B/8B are pure standard transformers — what PrismML used. 6x faster to train, better results.
+- For quick tests: Qwen3-0.6B. For real experiments on A40: Qwen3-1.7B. For production: Qwen3-8B on A100.
+
 **PTQ (post-training quantization) does NOT work at 1-bit:**
 - GPTQ with Hessian compensation, Hadamard rotation, sign-flip refinement → 0% on both 2B and 8B
 - Error compounds catastrophically through transformer layers — dead after 5 layers
@@ -151,4 +156,5 @@ Uses `ProgressiveQuantizedLinear` from `quantize_lib.py` with learned `log_scale
 | QAT v4.0 (top-K KL) | 2B | 0% | English words but KL drowned CE |
 | QAT v4.1 (MSE+cos, 1000 steps) | 2B | 0% | "The sun is a warm" — contextual! |
 | QAT v4.2 baseline (untrained + rep penalty) | 2B | 12% | 1/8 correct answers |
-| QAT v4.2 (3000 steps, in progress) | 2B | TBD | CE: 9.3→0.03→0.68 stable at noise=0.87 |
+| QAT v4.2 on Qwen3.5-2B (killed at step 525) | 2B hybrid | 12% | CE=0.73 at noise=0.94 — best on hybrid, but architecture is a blocker |
+| QAT v4.2 on Qwen3-1.7B (in progress) | 1.7B standard | TBD | 6x faster training, standard transformer, rep_penalty=2.0 |
