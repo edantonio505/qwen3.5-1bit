@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""1-bit QAT v4: Progressive quantization + scheduled sampling + top-K distillation.
+"""1-bit QAT v4.2: Aggressive 1-bit training with scheduled sampling.
 
-Three targeted fixes for the generation collapse problem:
-1. Scheduled sampling — feed model its own predictions during training to fix exposure bias
-2. Top-K KL distillation — focus loss on teacher's top 128 tokens (prevents KL explosion)
-3. Progressive quantization — anneal FP→4bit→2bit→1bit over training
+v4.1 proved the approach works (contextual English at 1-bit) but wasted 700/1000
+steps on easy phases (noise 0-0.9). v4.2 fixes this:
+- Start noise at 0.5, ramp to 1.0 by 20% of training, stay at 1.0 for 80%
+- 3000 steps default (2400 steps at full 1-bit)
+- Repetition penalty in eval to test if knowledge is hidden behind word doubling
 
 Usage:
-    # Quick validation (30 min)
-    python quantize/run_v4.py --model Qwen/Qwen3.5-2B --max-steps 200
+    # Quick validation
+    python quantize/run_v4.py --model Qwen/Qwen3.5-2B --max-steps 300
 
-    # Full training run (~8-12 hours)
+    # Full training run
     python quantize/run_v4.py --model Qwen/Qwen3.5-2B
 
     # 8B on larger GPU
@@ -40,11 +41,33 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).parent))
 from quantize_lib import (
-    ProgressiveQuantizedLinear, ProgressiveQuantizer,
+    ProgressiveQuantizedLinear,
     set_progressive_noise,
 )
 
 print = functools.partial(print, flush=True)
+
+
+class AggressiveQuantizer:
+    """Start at noise=0.5, ramp to 1.0 by 20% of steps, stay at 1.0 for 80%.
+
+    v4.1 showed the model only needed 300 steps at noise>0.9 to produce
+    contextual English. This schedule maximizes time at full 1-bit.
+    """
+
+    def __init__(self, total_steps):
+        self.total_steps = total_steps
+        self.ramp_end = int(total_steps * 0.2)
+
+    def get_noise_scale(self, step):
+        if step >= self.ramp_end:
+            return 1.0
+        return 0.5 + 0.5 * step / max(self.ramp_end, 1)
+
+    def get_phase_name(self, step):
+        if step < self.ramp_end:
+            return "ramp"
+        return "1bit"
 
 GROUP_SIZE = 128
 
@@ -184,11 +207,11 @@ def mix_with_student_predictions(student, input_ids, attention_mask, sampling_ra
 
 
 def get_sampling_ratio(step, total_steps):
-    """Ramp scheduled sampling from 0 → 0.3 over 70% of training."""
-    ramp_end = int(total_steps * 0.7)
+    """Ramp scheduled sampling from 0.1 → 0.3 over 50% of training."""
+    ramp_end = int(total_steps * 0.5)
     if step >= ramp_end:
         return 0.3
-    return 0.3 * step / max(ramp_end, 1)
+    return 0.1 + 0.2 * step / max(ramp_end, 1)
 
 
 # ══════════════════════════════════════════════════════════
@@ -243,6 +266,7 @@ def generate_answer(model, tokenizer, prompt, max_tokens=60):
     inp = tokenizer(text, return_tensors="pt").to(device)
     with torch.no_grad():
         out = model.generate(**inp, max_new_tokens=max_tokens, do_sample=False,
+                             repetition_penalty=1.3,
                              pad_token_id=tokenizer.pad_token_id)
     new_ids = out[0][inp["input_ids"].shape[1]:]
     clean = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
@@ -305,7 +329,7 @@ def main():
     parser.add_argument("--max-examples", type=int, default=30_000)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-6)
-    parser.add_argument("--output-dir", default="quantize/runs/v4")
+    parser.add_argument("--output-dir", default="quantize/runs/v4.2")
     parser.add_argument("--use-4bit-teacher", action="store_true",
                         help="Use 4-bit teacher (needed for 8B on <80GB)")
     parser.add_argument("--gen-check-interval", type=int, default=100)
@@ -427,8 +451,8 @@ def main():
         total_steps = min(total_steps, args.max_steps)
     warmup = max(1, int(total_steps * 0.05))
 
-    # Progressive quantization scheduler
-    prog = ProgressiveQuantizer(total_steps, warmup_fraction=0.1)
+    # Aggressive quantization scheduler: 0.5→1.0 in 20%, then 1.0 for 80%
+    prog = AggressiveQuantizer(total_steps)
 
     # Optimizer: higher LR for scales
     scale_p = [p for n, p in student.named_parameters() if "log_scale" in n]
@@ -442,8 +466,8 @@ def main():
     print(f"\n  Training plan:")
     print(f"    Steps:      {total_steps}")
     print(f"    Warmup:     {warmup}")
-    print(f"    Progressive: FP(0-10%) → 4bit(10-40%) → 2bit(40-70%) → 1bit(70-100%)")
-    print(f"    Sampling:   0% → 30% over 70% of training")
+    print(f"    Noise:      0.5→1.0 over 20%, then 1.0 for 80% ({int(total_steps*0.8)} steps at full 1-bit)")
+    print(f"    Sampling:   10% → 30% over 50% of training")
     print(f"    Loss:       normalized MSE (0.4) + cosine (0.2) + CE (0.4)")
     print()
 
