@@ -69,7 +69,7 @@ def detect_system():
 
     for i in range(info["num_gpus"]):
         name = torch.cuda.get_device_name(i)
-        vram = torch.cuda.get_device_properties(i).total_mem / 1e9
+        vram = torch.cuda.get_device_properties(i).total_memory / 1e9
         info["gpu_names"].append(name)
         info["per_gpu_vram_gb"].append(round(vram, 1))
         info["total_vram_gb"] += vram
