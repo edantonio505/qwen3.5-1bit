@@ -68,12 +68,25 @@ BONSAI_MODEL=1.7B ./scripts/download_models.sh  # download first if not yet fetc
 
 Building a 1-bit quantization pipeline targeting Q1_0_g128 format (1 sign bit + FP16 scale per 128 weights = 1.125 bits/weight). PrismML's Bonsai achieves 70.5% avg benchmark at 1-bit vs 79.3% FP16 using proprietary Caltech IP.
 
-### Running on Cloud GPU (RunPod)
+### Running on Cloud GPU (RunPod / 2x A100)
 
 ```bash
 git clone https://github.com/edantonio505/qwen3.5-1bit.git
 cd qwen3.5-1bit
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
+
+# CURRENT best command for 8B (v4.3 with BitLinear):
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  python3 quantize/run_v4.py \
+    --model Qwen/Qwen3-8B \
+    --use-4bit-teacher \
+    --max-steps 3000 \
+    --gen-check-interval 200 \
+    --eval-interval 500 \
+    --output-dir quantize/runs/v4.3-qwen3-8b \
+    2>&1 | tee run.log
+
+# Legacy (simpler but less features):
 PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B 2>&1 | tee run.log
 ```
 
@@ -93,19 +106,45 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 - Training loss converges perfectly (CE→0.003, cosine→0.30)
 - But model outputs `\n\n` repeated 60 times during generation
 - The model never sees its own errors during training
+- **Mitigation:** Scheduled sampling (10%→30%) mixes student's own predictions into training inputs
+
+**ProgressiveQuantizedLinear OOMs on 8B — use BitLinear instead:**
+- `ProgressiveQuantizedLinear` blends full-precision and 1-bit weights: `w + noise*(w_1bit - w)`
+- This creates 3 intermediate tensors per layer during forward pass
+- `STEQuantize1Bit` in quantize_lib.py saves signs in BF16 (2 bytes each)
+- For 252 layers of 8B, the intermediates + saved tensors exceed 80 GB on a single GPU
+- **Fix:** `BitLinear` (in run_v4.py and run_cloud.py) saves signs as int8 (1 byte = 50% savings), does no blending, pure 1-bit from start
+- Peak memory with BitLinear: **78 GB** vs 84+ GB (OOM) with ProgressiveQuantizedLinear
+
+**2x A100 80GB multi-GPU setup (confirmed working):**
+- Teacher (4-bit NF4) on GPU 0: ~6.4 GB
+- Student (BitLinear) on GPU 1: ~16.5 GB → peaks at ~78 GB during backward
+- Config: batch=1, seq=512, grad_accum=16, 8-bit AdamW
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` helps with fragmentation
+- Teacher logits `.detach().to(student_device)` — cross-GPU transfer, then free teacher KV cache
 
 **Single A100 80GB is NOT enough for 8B QAT:**
-- Teacher + student + optimizer + activations peaks at ~100-130 GB
-- Use 160GB+ GPU with 4-bit teacher, or multi-GPU
-- Batch=1 seq=512 is the minimum viable config for 8B
+- Even with BitLinear, student alone peaks at ~78 GB during backward
+- Teacher needs another ~6 GB on a separate GPU
+- Use 160GB+ single GPU or 2x 40GB+ multi-GPU
 
-**Memory optimizations in run_cloud.py:**
+**Memory optimizations (all applied in run_v4.py and run_cloud.py):**
 - Student loaded on CPU first, quantized, then moved to GPU
 - Scales computed in BF16 (no FP32 temp copies)
+- STE1Bit saves signs as int8 (not BF16) — 50% saved tensor reduction
 - Teacher logits detached and deleted before backward
+- `del s_out` after extracting logits (frees KV cache, hidden states)
+- `del s_logits, t_logits` before backward (only loss graph needed)
 - `zero_grad(set_to_none=True)` to free gradient memory
 - 4-bit teacher via bitsandbytes NF4
+- 8-bit AdamW via bitsandbytes (saves ~16 GB optimizer memory)
+- `gradient_checkpointing_enable()` on student
 - Aborts after 3 consecutive OOMs with actionable message
+
+**Transformers 5.5.0 compatibility:**
+- Requires `nn.Module.set_submodule()` which is only in PyTorch 2.5+
+- If using PyTorch 2.4.x, run_v4.py includes a monkey-patch for this
+- Symptom: `AttributeError: 'Qwen3ForCausalLM' object has no attribute 'set_submodule'`
 
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
@@ -118,7 +157,8 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 
 ```
 quantize/
-├── run_cloud.py       # CURRENT: Cloud QAT with 4-bit teacher, auto-detects GPUs/VRAM/arch
+├── run_v4.py          # CURRENT: v4.3 QAT with BitLinear (8B), progressive (2B), scheduled sampling
+├── run_cloud.py       # Cloud QAT with BitLinear + 4-bit teacher, auto-detects GPUs/VRAM/arch
 ├── run.py             # Local QAT with SubLN + dynamic scales (for DIGITS)
 ├── quantize_lib.py    # Shared library: ProgressiveQuantizedLinear, Hadamard, learned scales, STE
 ├── auto_tune.py       # Hyperparameter search loop (8 configs)
@@ -127,20 +167,25 @@ quantize/
 └── train.py           # Standalone training script
 ```
 
-### Training Architecture
+### Training Architecture (run_v4.py)
 
 - **Loss:** Normalized logit MSE (0.4) + cosine similarity (0.2) + CE (0.4)
 - **Teacher:** Frozen copy of base model (4-bit via bitsandbytes for 8B+)
 - **Student:** Same model with BitLinear layers (1-bit weights, learned group scales)
+- **Quantizer:** BitLinear for 8B (memory-efficient, int8 signs), ProgressiveQuantizedLinear for 2B (blending schedule)
+- **Scheduled sampling:** 10%→30% of tokens replaced with student's own predictions during training
+- **Data mix:** 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + custom factual)
 - **Skipped layers:** Embedding + LM head kept in FP16
-- **Optimizer:** AdamW with separate LR for scale params (10x multiplier)
+- **Optimizer:** 8-bit AdamW with separate LR for scale params (10x multiplier)
+- **Eval:** Repetition penalty 2.0, no_repeat_ngram_size=3, greedy decoding
 
 ### GPU Requirements
 
-| Model | Total VRAM | Example GPU |
-|-------|-----------|-------------|
-| Qwen3.5-2B | ~40 GB | A40 48GB |
-| Qwen3-8B (4-bit teacher) | ~80-100 GB | 1x 160GB or 2x48GB |
-| Qwen3.5-35B | ~380 GB | 8x A100 80GB |
+| Model | Config | Total VRAM | Example GPU |
+|-------|--------|-----------|-------------|
+| Qwen3.5-2B | BF16 teacher + ProgressiveQuantized student | ~40 GB | A40 48GB |
+| Qwen3-8B | 4-bit teacher (GPU 0) + BitLinear student (GPU 1) | ~78 GB peak per GPU | 2x A100 80GB |
+| Qwen3-8B | 4-bit teacher + BitLinear student (single GPU) | ~85 GB peak | 1x H100 96GB or 1x A100 160GB |
+| Qwen3.5-35B | 4-bit teacher + student | ~380 GB | 8x A100 80GB |
 
-**A single 80GB GPU (A100) will OOM on 8B.** Peak memory during backward pass exceeds 100GB. Use 160GB+ or multi-GPU with `device_map="auto"`.
+**A single 80GB GPU (A100) will OOM on 8B.** Use 2x A100 80GB (teacher/student split) or 1x 160GB+.

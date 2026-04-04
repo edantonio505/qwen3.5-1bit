@@ -30,6 +30,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+# Monkey-patch set_submodule for PyTorch <2.5 (needed by transformers 5.5+)
+if not hasattr(nn.Module, "set_submodule"):
+    def _set_submodule(self, target, module):
+        atoms = target.split(".")
+        mod = self
+        for atom in atoms[:-1]:
+            mod = getattr(mod, atom)
+        setattr(mod, atoms[-1], module)
+    nn.Module.set_submodule = _set_submodule
+
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer,
     BitsAndBytesConfig, get_cosine_schedule_with_warmup,
@@ -44,6 +55,51 @@ from quantize_lib import (
     ProgressiveQuantizedLinear,
     set_progressive_noise,
 )
+
+
+# ══════════════════════════════════════════════════════════
+#  Memory-efficient 1-bit for 8B+ models (from run_cloud.py)
+#  - Saves signs as int8 (50% less memory vs BF16)
+#  - No blending (pure 1-bit from start)
+# ══════════════════════════════════════════════════════════
+
+class STE1Bit(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight, scales):
+        shape = weight.shape
+        flat = weight.reshape(-1, GROUP_SIZE)
+        signs = flat.sign()
+        signs[signs == 0] = 1.0
+        ctx.save_for_backward(signs.to(torch.int8))  # int8 = 1 byte vs BF16 2 bytes
+        return (scales * signs).reshape(shape)
+
+    @staticmethod
+    def backward(ctx, grad):
+        signs_int8, = ctx.saved_tensors
+        signs = signs_int8.to(grad.dtype)
+        flat_g = grad.reshape(-1, GROUP_SIZE)
+        scale_grad = (flat_g * signs).sum(dim=1, keepdim=True)
+        return grad, scale_grad
+
+
+class BitLinear(nn.Module):
+    """Memory-efficient 1-bit linear for 8B models. No progressive blending."""
+    def __init__(self, orig: nn.Linear):
+        super().__init__()
+        self.weight = orig.weight
+        self.bias = orig.bias
+        self.in_features = orig.in_features
+        self.out_features = orig.out_features
+        with torch.no_grad():
+            num_groups = self.weight.numel() // GROUP_SIZE
+            flat = self.weight.data.reshape(num_groups, GROUP_SIZE)
+            init = flat.abs().mean(dim=1, keepdim=True)
+        self.log_scale = nn.Parameter(torch.log(init + 1e-8))
+
+    def forward(self, x):
+        scales = torch.exp(self.log_scale)
+        q_w = STE1Bit.apply(self.weight, scales)
+        return F.linear(x, q_w, self.bias)
 
 print = functools.partial(print, flush=True)
 
@@ -110,8 +166,9 @@ def auto_config(info, model_name, use_4bit_teacher):
     if is_8b:
         if num_gpus >= 2 and min(per_gpu[:2]) >= 40:
             # 2+ GPUs: teacher on GPU 0, student on GPU 1
-            # Student gets full GPU — can use batch=2
-            return {"batch_size": 2, "grad_accum": 8, "max_seq_len": 1024,
+            # ProgressiveQuantizedLinear blending doubles weight memory,
+            # so batch=1 seq=512 is safest for 8B even with 80GB per GPU
+            return {"batch_size": 1, "grad_accum": 16, "max_seq_len": 512,
                     "multi_gpu": True}
         elif total >= 160:
             return {"batch_size": 4, "grad_accum": 4, "max_seq_len": 2048}
@@ -152,6 +209,29 @@ def replace_linears_progressive(model, skip_patterns=None):
                 replaced += 1
 
     print(f"  Quantized: {replaced} layers (progressive) | Kept FP: {skipped} layers")
+    return replaced
+
+
+def replace_linears_bitlinear(model, skip_patterns=None):
+    """Replace nn.Linear with memory-efficient BitLinear (for 8B+ models)."""
+    if skip_patterns is None:
+        skip_patterns = ["norm", "layernorm", "rmsnorm", "embed", "lm_head"]
+
+    replaced = skipped = 0
+    for name, mod in model.named_modules():
+        for cname, child in mod.named_children():
+            full = f"{name}.{cname}" if name else cname
+            if isinstance(child, nn.Linear):
+                if any(pat in full.lower() for pat in skip_patterns):
+                    skipped += 1
+                    continue
+                if child.weight.numel() % GROUP_SIZE != 0:
+                    skipped += 1
+                    continue
+                setattr(mod, cname, BitLinear(child))
+                replaced += 1
+
+    print(f"  Quantized: {replaced} layers (BitLinear, mem-efficient) | Kept FP: {skipped} layers")
     return replaced
 
 
@@ -485,6 +565,10 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--max-steps", type=int, default=0,
                         help="Stop after N steps (0 = run full epochs)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override auto-detected batch size")
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="Override auto-detected sequence length")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -510,6 +594,10 @@ def main():
 
     hw = auto_config(sys_info, args.model, args.use_4bit_teacher)
     multi_gpu = hw.pop("multi_gpu", False)
+    if args.batch_size is not None:
+        hw["batch_size"] = args.batch_size
+    if args.seq_len is not None:
+        hw["max_seq_len"] = args.seq_len
 
     if multi_gpu:
         teacher_device = torch.device("cuda:0")
@@ -561,15 +649,21 @@ def main():
     print(f"  Teacher: {tgb:.2f} GB")
 
     # ── Student ──
-    print("[3/5] Student (progressive quantization)...")
+    is_8b = any(s in args.model for s in ["8B", "8b", "9B", "9b"])
+    use_bitlinear = is_8b  # BitLinear = memory-efficient, no progressive blending
+    mode_label = "BitLinear, mem-efficient" if use_bitlinear else "progressive"
+    print(f"[3/5] Student ({mode_label})...")
     student = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=torch.bfloat16,
         trust_remote_code=True, attn_implementation="sdpa",
     )
     student.gradient_checkpointing_enable()
 
-    n_replaced = replace_linears_progressive(student,
-        skip_patterns=["norm", "layernorm", "rmsnorm", "embed", "lm_head"])
+    skip = ["norm", "layernorm", "rmsnorm", "embed", "lm_head"]
+    if use_bitlinear:
+        n_replaced = replace_linears_bitlinear(student, skip_patterns=skip)
+    else:
+        n_replaced = replace_linears_progressive(student, skip_patterns=skip)
     student.to(student_device).train()
     sgb = sum(p.numel() * p.element_size() for p in student.parameters()) / 1e9
     print(f"  Student: {sgb:.2f} GB")
@@ -581,11 +675,11 @@ def main():
 
     # ── Baseline eval ──
     print("\n[4/5] Baseline evaluation...")
-    # Set to full 1-bit for baseline measurement
-    set_progressive_noise(student, 1.0)
+    if not use_bitlinear:
+        set_progressive_noise(student, 1.0)
     baseline = run_eval(student, tok, "BASELINE (1-bit, untrained)")
-    # Reset to FP for training start
-    set_progressive_noise(student, 0.0)
+    if not use_bitlinear:
+        set_progressive_noise(student, 0.0)
     teacher_score = run_eval(teacher, tok, "TEACHER")
 
     # ── Data ──
@@ -643,7 +737,10 @@ def main():
     print(f"\n  Training plan:")
     print(f"    Steps:      {total_steps}")
     print(f"    Warmup:     {warmup}")
-    print(f"    Noise:      0.5→1.0 over 20%, then 1.0 for 80% ({int(total_steps*0.8)} steps at full 1-bit)")
+    if use_bitlinear:
+        print(f"    Mode:       BitLinear (full 1-bit from start, memory-efficient)")
+    else:
+        print(f"    Noise:      0.5→1.0 over 20%, then 1.0 for 80% ({int(total_steps*0.8)} steps at full 1-bit)")
     print(f"    Sampling:   10% → 30% over 50% of training")
     print(f"    Loss:       normalized MSE (0.4) + cosine (0.2) + CE (0.4)")
     print()
@@ -658,9 +755,10 @@ def main():
 
     for epoch in range(args.epochs):
         for bi, batch in enumerate(loader):
-            # Update progressive quantization noise
-            noise = prog.get_noise_scale(step)
-            set_progressive_noise(student, noise)
+            # Update progressive quantization noise (BitLinear is always 1-bit)
+            noise = 1.0 if use_bitlinear else prog.get_noise_scale(step)
+            if not use_bitlinear:
+                set_progressive_noise(student, noise)
 
             # Scheduled sampling ratio
             sr = get_sampling_ratio(step, total_steps)
@@ -689,25 +787,33 @@ def main():
                         mixed_ids = s_batch["input_ids"]
 
                     # Student forward
-                    s_logits = student(
+                    s_out = student(
                         input_ids=mixed_ids,
                         attention_mask=s_batch["attention_mask"],
-                    ).logits
+                    )
+                    s_logits = s_out.logits
+                    del s_out  # free KV cache, hidden states
 
                     loss, dist_v, ce_v, alpha = compute_loss(
                         s_logits, t_logits, labels, step, total_steps)
+                    del s_logits, t_logits  # free logits before backward
                     loss = loss / hw["grad_accum"]
 
                 loss.backward()
-                del s_batch, t_logits
+                del s_batch, labels
 
             except torch.cuda.OutOfMemoryError:
                 oom_count += 1
-                print(f"  OOM at step {step}! Clearing cache... (#{oom_count})")
+                for dev in range(torch.cuda.device_count()):
+                    a = torch.cuda.memory_allocated(dev) / 1e9
+                    p = torch.cuda.max_memory_allocated(dev) / 1e9
+                    print(f"  OOM #{oom_count} at step {step} | GPU {dev}: {a:.1f}GB alloc, {p:.1f}GB peak")
+                gc.collect()
                 torch.cuda.empty_cache()
-                opt.zero_grad()
-                if oom_count >= 10:
-                    raise RuntimeError(f"OOM {oom_count}x — reduce batch_size or seq_len")
+                opt.zero_grad(set_to_none=True)
+                if oom_count >= 3:
+                    print(f"  FATAL: 3 consecutive OOMs. batch={hw['batch_size']} seq={hw['max_seq_len']}")
+                    return
                 continue
 
             log_loss += loss.item() * hw["grad_accum"]
@@ -719,7 +825,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                 opt.step()
                 sched.step()
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
                 step += 1
 
                 # Logging
@@ -727,18 +833,23 @@ def main():
                     el = time.time() - t0
                     eta = (total_steps - step) / max(step / el, 1e-9)
                     phase = prog.get_phase_name(step)
+                    gpu_idx = student_device.index or 0
+                    peak_gb = torch.cuda.max_memory_allocated(gpu_idx) / 1e9
+                    alloc_gb = torch.cuda.memory_allocated(gpu_idx) / 1e9
                     print(f"  {step:>5d}/{total_steps} | "
                           f"loss={log_loss/log_n:.3f} dist={log_dist/log_n:.3f} "
                           f"CE={log_ce/log_n:.3f} | "
                           f"α={alpha:.2f} sr={sr:.2f} noise={noise:.2f} [{phase}] | "
+                          f"GPU={alloc_gb:.0f}/{peak_gb:.0f}GB | "
                           f"lr={sched.get_last_lr()[0]:.1e} | ETA {eta/60:.1f}m")
                     log_loss = log_dist = log_ce = log_n = 0
 
                 # Quick generation check
                 if step % args.gen_check_interval == 0:
                     student.eval()
-                    # Force full 1-bit for eval
-                    set_progressive_noise(student, 1.0)
+                    if not use_bitlinear:
+                        set_progressive_noise(student, 1.0)
+                    torch.cuda.empty_cache()
                     c1, _, _ = generate_answer(student, tok, "Capital of France? One word.")
                     c2, _, _ = generate_answer(student, tok, "2+2=? Just the number.")
                     c3, _, _ = generate_answer(student, tok, "What color is the sky?")
@@ -748,13 +859,15 @@ def main():
                     print(f"  >> France: {(c1 or '[EMPTY]')[:40]}{r1} | "
                           f"2+2: {(c2 or '[EMPTY]')[:40]}{r2} | "
                           f"Sky: {(c3 or '[EMPTY]')[:40]}{r3}")
-                    # Restore noise for training
-                    set_progressive_noise(student, noise)
+                    if not use_bitlinear:
+                        set_progressive_noise(student, noise)
                     student.train()
+                    torch.cuda.empty_cache()
 
                 # Full eval
                 if step % args.eval_interval == 0:
-                    set_progressive_noise(student, 1.0)
+                    if not use_bitlinear:
+                        set_progressive_noise(student, 1.0)
                     score = run_eval(student, tok, f"step {step}/{total_steps}")
                     if score > best_score:
                         best_score = score
@@ -767,7 +880,8 @@ def main():
                         tok.save_pretrained(ckpt_dir)
                         with open(ckpt_dir / "training_state.json", "w") as f:
                             json.dump({"step": step, "score": score, "noise": noise}, f)
-                    set_progressive_noise(student, noise)
+                    if not use_bitlinear:
+                        set_progressive_noise(student, noise)
                     student.train()
 
                 if step >= total_steps:
@@ -779,7 +893,8 @@ def main():
     print(f"\n  Training: {train_min:.1f} min, {step} steps")
 
     # ── Final eval at full 1-bit ──
-    set_progressive_noise(student, 1.0)
+    if not use_bitlinear:
+        set_progressive_noise(student, 1.0)
     final = run_eval(student, tok, "FINAL (1-bit)")
 
     print(f"\n{'=' * 60}")

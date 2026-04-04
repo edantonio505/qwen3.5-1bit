@@ -10,7 +10,18 @@ cd qwen3.5-1bit
 # 2. Install deps
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 3. Run (auto-detects GPUs, VRAM, architecture)
+# 3. Run v4.3 (CURRENT BEST — auto-detects GPUs, uses BitLinear for 8B)
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  python3 quantize/run_v4.py \
+    --model Qwen/Qwen3-8B \
+    --use-4bit-teacher \
+    --max-steps 3000 \
+    --gen-check-interval 200 \
+    --eval-interval 500 \
+    --output-dir quantize/runs/v4.3-qwen3-8b \
+    2>&1 | tee run.log
+
+# Legacy (simpler, no scheduled sampling):
 PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B 2>&1 | tee run.log
 ```
 
@@ -18,27 +29,39 @@ PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B 2>&1 | tee
 
 Measured from actual training runs (teacher + student + optimizer + gradients + activations):
 
-| Model | Teacher | Total VRAM | Minimum GPU | Cost |
-|---|---|---|---|---|
-| Qwen3.5-2B | BF16 (3.8 GB) | ~40 GB | 1x A40 48GB | ~$0.40/hr |
-| Qwen3-8B | 4-bit (4 GB) | ~100 GB peak | 1x 160GB GPU | ~$2-3/hr |
-| Qwen3-8B | BF16 (16 GB) | ~100 GB | 2x L40S 48GB | ~$2/hr |
+| Model | Teacher | Quantizer | Total VRAM | Minimum GPU | Cost |
+|---|---|---|---|---|---|
+| Qwen3.5-2B | BF16 (3.8 GB) | ProgressiveQuantized | ~40 GB | 1x A40 48GB | ~$0.40/hr |
+| Qwen3-8B | 4-bit NF4 (6.4 GB) | BitLinear | ~78 GB peak/GPU | 2x A100 80GB | ~$3/hr |
+| Qwen3-8B | 4-bit NF4 | BitLinear (single GPU) | ~85 GB peak | 1x H100 96GB | ~$4/hr |
 
 **Will NOT fit on 24GB GPUs** (RTX 3090/4090) — even the 2B model needs ~40 GB.
 
+**Will NOT fit on 1x A100 80GB** for 8B — student alone peaks at ~78 GB, teacher needs ~6 GB more.
+
 ## What the Script Does
 
-`run_cloud.py` auto-detects:
-- Number of GPUs → splits teacher model across them
-- Total VRAM → sets batch size accordingly
-- Architecture (x86_64 vs aarch64) → warns if ARM
+`run_v4.py` auto-detects:
+- Number of GPUs → multi-GPU mode (teacher GPU 0, student GPU 1) or single GPU
+- Total VRAM → sets batch size, seq length, grad accumulation
+- Model size → uses BitLinear (8B+) or ProgressiveQuantizedLinear (2B)
 
 It then:
-1. Loads teacher (4-bit via bitsandbytes) — frozen, provides soft targets
-2. Loads student (BF16) — with 1-bit quantized linear layers
-3. Trains with normalized logit MSE + cosine similarity + CE
-4. Runs generation checks every 50 steps
-5. Evaluates and saves to `quantize/runs/cloud/`
+1. Loads teacher (4-bit via bitsandbytes NF4) on GPU 0 — frozen, provides soft targets
+2. Loads student (BF16 → BitLinear 1-bit) on GPU 1 — with gradient checkpointing
+3. Loads mixed data: 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + factual pairs)
+4. Trains with normalized logit MSE (0.4) + cosine (0.2) + CE (0.4)
+5. Uses scheduled sampling (10%→30%) to mix student predictions into training
+6. Runs generation checks every 200 steps, full eval every 500 steps
+7. Saves best checkpoint + final model to output dir
+
+### Memory-critical details
+- **BitLinear** (not ProgressiveQuantizedLinear) for 8B: saves signs as int8 (1 byte vs 2), no blending
+- **8-bit AdamW** via bitsandbytes saves ~16 GB optimizer memory
+- `del s_out` after extracting logits frees KV cache + hidden states
+- `del s_logits, t_logits` before backward — only loss graph needed
+- `zero_grad(set_to_none=True)` frees gradient tensors vs zeroing
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` reduces fragmentation
 
 ## What We've Learned (Critical Context)
 
@@ -47,7 +70,19 @@ Training loss converges perfectly (CE: 10→0.003, cosine: 0.8→0.3) but the
 model outputs `\n\n` repeated 60 times during generation. This happens because:
 - Teacher forcing during training gives the model correct input tokens
 - During generation, the model must use its own (wrong) outputs
-- With 1-bit weights, small errors cascade through 28 layers and collapse
+- With 1-bit weights, small errors cascade through 28+ layers and collapse
+- **v4.3 mitigation:** Scheduled sampling (10%→30%) replaces some teacher tokens with student's own predictions
+
+### Memory lessons learned the hard way
+
+| Issue | Symptom | Fix |
+|---|---|---|
+| ProgressiveQuantizedLinear on 8B | OOM at 84+ GB (blending intermediates) | Switch to BitLinear (int8 signs, no blending) |
+| Standard AdamW on 8B | OOM from ~32 GB optimizer states | Use 8-bit AdamW via bitsandbytes |
+| transformers 5.5 + PyTorch 2.4 | `AttributeError: set_submodule` | Monkey-patch in run_v4.py |
+| Logits not freed before backward | Peak memory too high | `del s_logits, t_logits` before `loss.backward()` |
+| Gradients not freed after step | Memory stays high between steps | `zero_grad(set_to_none=True)` |
+| KV cache fragments | OOM on generation checks | `torch.cuda.empty_cache()` before/after eval |
 
 ### What we tried on DIGITS (128GB, GB10)
 
@@ -61,26 +96,28 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 
 ### Key findings
 1. **KL divergence is WRONG for 1-bit** — explodes over 151k vocab. Use MSE + cosine instead.
-2. **SubLN helps at init** but training pushes model back to \n\n attractor
-3. **"Paris" moved from rank 134,940 to 18,016** in 375 steps — model IS learning, just not enough
-4. **Need 10-100x more steps** — DIGITS is too slow (~4hrs for 1250 steps on 2B)
-5. **Dynamic scales work** — learned scales had shape bugs with Qwen3.5 architecture
+2. **ProgressiveQuantizedLinear OOMs on 8B** — blending creates 3 intermediate tensors per layer. BitLinear with int8 signs fits.
+3. **2x A100 80GB works** — teacher GPU 0 (6.4 GB), student GPU 1 (peaks 78 GB). Config: batch=1, seq=512, grad_accum=16.
+4. **SubLN helps at init** but training pushes model back to \n\n attractor
+5. **"Paris" moved from rank 134,940 to 18,016** in 375 steps — model IS learning, just not enough
+6. **Need 10-100x more steps** — DIGITS is too slow (~4hrs for 1250 steps on 2B)
+7. **Dynamic scales work** — learned scales had shape bugs with Qwen3.5 architecture
+8. **8-bit AdamW is essential for 8B** — saves ~16 GB, difference between OOM and fitting
 
-### What to try on RunPod (with 10x speed)
+### v4.3 run in progress (2026-04-04)
+- 2x A100 80GB, Qwen3-8B, BitLinear, 4-bit teacher
+- 3000 steps, batch=1, seq=512, grad_accum=16, 8-bit AdamW
+- 35k examples (30k chat + 5k QA), scheduled sampling 10%→30%
+- Early: loss 8.62→8.27 (3 steps), GPU stable at 33/78 GB, no OOM
 
-Priority order:
-1. **Much more data + steps** — 50k examples, 5 epochs, 10k+ steps
-2. **Ternary {-1, 0, +1}** — BitNet b1.58 approach, proven at scale. Modify STE1Bit to round to {-1,0,+1} instead of sign.
-3. **Scheduled sampling** — during training, randomly use model's own generated tokens instead of teacher-forced tokens
-4. **Hadamard rotation** — spread weight outliers before binarization
-
-### Architecture notes for Qwen3.5
+### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically
 - `lm_head`: Linear — skip explicitly
+- Qwen3-8B has 252 quantizable linear layers + 1 skipped (lm_head)
 - `in_proj_qkv`: Fused QKV projection, shape [6144, 2048] for 2B
-- `in_proj_a`, `in_proj_b`: Small projections [16, 2048]
-- `linear_attn`: Qwen3_5GatedDeltaNet (custom attention)
-- Some layers have `sub_ln` (RMSNorm) added by our BitLinear wrapper
+- `in_proj_a`, `in_proj_b`: Small projections [16, 2048] (Qwen3.5 only)
+- `linear_attn`: Qwen3_5GatedDeltaNet (Qwen3.5 custom attention, NOT in Qwen3)
+- Qwen3-8B is a standard dense transformer — no hybrid attention
 
 ### PrismML Bonsai (for reference)
 - True binary {-d, +d}, NOT ternary
@@ -95,8 +132,9 @@ Priority order:
 
 ```
 quantize/
-├── run.py            # Local training (v3: SubLN + dynamic scales)
-├── run_cloud.py      # Cloud training (multi-GPU, 4-bit teacher, auto-detect)
+├── run_v4.py         # CURRENT: v4.3 — BitLinear (8B) / Progressive (2B), scheduled sampling
+├── run_cloud.py      # Cloud training (multi-GPU, 4-bit teacher, auto-detect, BitLinear)
+├── run.py            # Legacy: local training with SubLN + dynamic scales
 ├── quantize_lib.py   # Full library (progressive quant, Hadamard, learned scales)
 ├── auto_tune.py      # Hyperparameter search loop (8 configs)
 ├── evaluate.py       # Benchmark evaluation
