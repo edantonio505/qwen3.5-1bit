@@ -68,28 +68,59 @@ BONSAI_MODEL=1.7B ./scripts/download_models.sh  # download first if not yet fetc
 
 Building a 1-bit quantization pipeline targeting Q1_0_g128 format (1 sign bit + FP16 scale per 128 weights = 1.125 bits/weight). PrismML's Bonsai achieves 70.5% avg benchmark at 1-bit vs 79.3% FP16 using proprietary Caltech IP.
 
+### IMMEDIATE NEXT STEP — Run on A100 80GB
+
+The pipeline is validated on 1.7B. Now needs Qwen3-8B on A100 80GB (the exact model PrismML used for Bonsai).
+
+```bash
+# On new A100 80GB server:
+git clone https://github.com/edantonio505/qwen3.5-1bit.git
+cd qwen3.5-1bit
+python3 -m venv .venv
+
+# IMPORTANT: Install PyTorch matching your CUDA version first
+# Check CUDA: nvidia-smi | head -3
+# For CUDA 12.4: pip install torch --index-url https://download.pytorch.org/whl/cu124
+# For CUDA 12.1: pip install torch --index-url https://download.pytorch.org/whl/cu121
+# For CUDA 12.8+: pip install torch (latest should work)
+.venv/bin/pip install torch transformers accelerate datasets bitsandbytes sentencepiece protobuf huggingface-hub
+
+# Run the 8B training (needs bitsandbytes for 4-bit teacher)
+PYTHONUNBUFFERED=1 .venv/bin/python quantize/run_v4.py \
+  --model Qwen/Qwen3-8B \
+  --use-4bit-teacher \
+  --max-steps 3000 \
+  --gen-check-interval 200 \
+  --eval-interval 500 \
+  --output-dir quantize/runs/v4.3-qwen3-8b \
+  2>&1 | tee run.log
+```
+
 ### Quantization Format: Q1_0_g128
 
 Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` and `scale_g` is a shared FP16 scale per group of 128 weights. This is the format PrismML uses for Bonsai models.
 
-### What We Learned (Critical Knowledge)
+### What We Learned (Critical Knowledge — Read ALL of This)
 
-**Use standard transformers (Qwen3), NOT hybrid (Qwen3.5):**
-- Qwen3.5-2B uses GatedDeltaNet (75% linear attention with recurrent state) — fundamentally harder to quantize. Recurrent state compounds errors through time.
-- Qwen3-1.7B/8B are pure standard transformers — what PrismML used. 6x faster to train, better results.
-- For quick tests: Qwen3-0.6B. For real experiments on A40: Qwen3-1.7B. For production: Qwen3-8B on A100.
+**Use Qwen3-8B (standard transformer). NOT Qwen3.5 (hybrid).**
+- Qwen3.5 uses GatedDeltaNet (75% linear attention with recurrent state) — fundamentally harder to quantize. Recurrent state compounds errors through time.
+- Qwen3 models are pure standard transformers — what PrismML used.
+- Training is 6x faster on standard transformers.
+- 1.7B was tested and works but CE plateaus at ~1.7. Likely needs 8B scale for the breakthrough.
 
 **PTQ (post-training quantization) does NOT work at 1-bit:**
 - GPTQ with Hessian compensation, Hadamard rotation, sign-flip refinement → 0% on both 2B and 8B
 - Error compounds catastrophically through transformer layers — dead after 5 layers
 - `gptq_1bit.py` has `--eval-every N` flag for early abort detection
+- DO NOT waste time on PTQ approaches. QAT is required.
 
-**QAT (quantization-aware training) is required, with specific techniques:**
+**QAT (quantization-aware training) is required, with these specific techniques:**
 - KL divergence explodes over 151k vocab at 1-bit — use normalized MSE + cosine + CE instead
 - Teacher forcing causes generation collapse (loss converges but model outputs `\n\n`) — need scheduled sampling
-- Jumping straight to 1-bit fails — need progressive quantization (gradual noise annealing)
-- Word doubling artifact ("TheThe", "is is") at 1-bit — repetition penalty 1.3 in generation reveals hidden knowledge
+- Jumping straight to 1-bit fails — need progressive quantization (AggressiveQuantizer: 0.5→1.0)
+- Word doubling artifact ("TheThe", "is is") at 1-bit — use repetition_penalty=2.0 + no_repeat_ngram_size=3
 - Embed + LM head must stay in FP16 (critical for generation quality)
+- Training data must include short-answer QA (TriviaQA + GSM8K + custom factual pairs), not just conversations
 
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
@@ -102,59 +133,61 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 
 ```
 quantize/
-├── run_v4.py          # Current: QAT v4.2 (progressive quant + scheduled sampling + MSE distillation)
-├── run_cloud.py       # Prior: QAT with 4-bit teacher, auto-detects GPUs/VRAM
-├── run.py             # Prior: Local QAT with SubLN + dynamic scales
-├── gptq_1bit.py       # GPTQ 1-bit PTQ (proven insufficient, but useful for analysis)
+├── run_v4.py          # CURRENT: QAT v4.3 (progressive quant + scheduled sampling + QA data mix)
+├── run_cloud.py       # Legacy: QAT with 4-bit teacher, auto-detects GPUs/VRAM
+├── run.py             # Legacy: Local QAT with SubLN + dynamic scales
+├── gptq_1bit.py       # GPTQ 1-bit PTQ (proven insufficient, useful for analysis)
 ├── quantize_lib.py    # Shared library: ProgressiveQuantizedLinear, Hadamard, learned scales, STE
-├── auto_tune.py       # Hyperparameter search
+├── auto_tune.py       # Hyperparameter search loop
 ├── evaluate.py        # Benchmark evaluation
 ├── export_gguf.py     # Export to Q1_0_g128 GGUF format
 └── train.py           # Standalone training script
 ```
 
-### Running Quantization (Current Approach: run_v4.py)
+### v4.3 Architecture (Current)
 
-```bash
-# Install deps (if no venv)
-python3 -m venv .venv
-.venv/bin/pip install torch transformers accelerate datasets sentencepiece protobuf huggingface-hub
-
-# Quick validation (300 steps, ~2 hours)
-.venv/bin/python quantize/run_v4.py --model Qwen/Qwen3.5-2B --max-steps 300
-
-# Full training (3000 steps, ~20 hours on A40)
-.venv/bin/python quantize/run_v4.py --model Qwen/Qwen3.5-2B
-
-# 8B model (needs A100 80GB+)
-.venv/bin/python quantize/run_v4.py --model Qwen/Qwen3-8B --use-4bit-teacher
-```
-
-### v4.2 Architecture (Current)
-
-Three key techniques combined:
+Four key techniques combined:
 1. **AggressiveQuantizer** — starts noise at 0.5, ramps to 1.0 by 20% of steps, stays at 1.0 for 80%. Maximizes training time at full 1-bit.
 2. **Scheduled sampling** — mixes student's own predictions into training inputs (10%→30% over training) to fix exposure bias from teacher forcing.
-3. **Normalized MSE + cosine + CE loss** — distills from BF16 teacher without KL explosion. Weights: MSE 0.4, cosine 0.2, CE 0.4.
+3. **Normalized MSE + cosine + CE loss** — distills from BF16/4-bit teacher without KL explosion. Weights: MSE 0.4, cosine 0.2, CE 0.4.
+4. **QA data mix** — 60% OpenHermes conversations + 40% short-answer QA (TriviaQA + GSM8K + custom factual pairs). Teaches model to produce concise answers, not paragraphs.
 
 Uses `ProgressiveQuantizedLinear` from `quantize_lib.py` with learned `log_scale` parameters (10x LR multiplier).
+Eval uses `repetition_penalty=2.0` + `no_repeat_ngram_size=3` to counter word-doubling artifact.
 
 ### GPU Requirements
 
 | Model | Task | Min VRAM | Notes |
 |-------|------|----------|-------|
-| Qwen3.5-2B | QAT training | 40 GB | A40 48GB works |
-| Qwen3-8B | QAT training | 78 GB | A100 80GB with 4-bit teacher |
-| Qwen3-8B | GPTQ (PTQ) | 20 GB | A40 works, but PTQ doesn't help at 1-bit |
+| Qwen3-1.7B | QAT training | 40 GB | A40 48GB works. CE plateaus at ~1.7. |
+| **Qwen3-8B** | **QAT training** | **78 GB** | **A100 80GB with 4-bit teacher. THIS IS THE TARGET.** |
+| Qwen3-8B | GPTQ (PTQ) | 20 GB | Don't bother — PTQ doesn't work at 1-bit |
 
-### Results History
+### Complete Results History
 
-| Approach | Model | Score | Key Output |
-|----------|-------|-------|------------|
-| GPTQ PTQ | 2B/8B | 0% | "FGFG" garbage |
-| QAT run_cloud.py | 2B | 0% | `\n\n\n` empty |
-| QAT v4.0 (top-K KL) | 2B | 0% | English words but KL drowned CE |
-| QAT v4.1 (MSE+cos, 1000 steps) | 2B | 0% | "The sun is a warm" — contextual! |
-| QAT v4.2 baseline (untrained + rep penalty) | 2B | 12% | 1/8 correct answers |
-| QAT v4.2 on Qwen3.5-2B (killed at step 525) | 2B hybrid | 12% | CE=0.73 at noise=0.94 — best on hybrid, but architecture is a blocker |
-| QAT v4.2 on Qwen3-1.7B (in progress) | 1.7B standard | TBD | 6x faster training, standard transformer, rep_penalty=2.0 |
+| Approach | Model | Score | CE at 1-bit | Key Finding |
+|----------|-------|-------|-------------|-------------|
+| GPTQ PTQ | 2B/8B | 0% | N/A | PTQ dead end — error compounds through layers |
+| QAT run_cloud.py | 2B | 0% | ~0.003 train | Loss converges but generation collapses (teacher forcing) |
+| QAT v4.0 (top-K KL) | 2B hybrid | 0% | 3.5 | KL clamped at 50, drowned CE signal |
+| QAT v4.1 (MSE+cos, 1000 steps) | 2B hybrid | 0% | 1.8 | First contextual English ("The sun is a warm") |
+| QAT v4.2 on Qwen3.5-2B | 2B hybrid | 12% | 0.73* | *noise=0.94 not full 1-bit. Hybrid arch is blocker. |
+| QAT v4.2 on Qwen3-1.7B (chat only) | 1.7B standard | 0% | 1.7 plateau | Standard transformer confirmed 6x faster |
+| QAT v4.3 on Qwen3-1.7B (QA mix) | 1.7B standard | 12% | ~1.7 plateau | QA data didn't change CE trajectory at 1.7B scale |
+| **QAT v4.3 on Qwen3-8B** | **8B standard** | **TBD** | **TBD** | **NEXT: Run on A100 80GB** |
+
+### What to Watch For During 8B Training
+
+- **CE at 1-bit entry (step ~600)**: Should be ~2.0. If much higher, increase LR.
+- **CE at step 1000**: If below 1.5, we're on track. If plateauing at 1.7+ like 1.7B, may need longer training.
+- **Generation checks**: Look for factual content, not just English words. "Paris" for France, numbers for math.
+- **Step 500 eval**: First full eval. If >12%, the approach is working.
+- **Step 1000 eval**: If >25%, this is a breakthrough. Scale up training.
+
+### If 8B Also Plateaus at CE ~1.7
+
+Fallback options (in priority order):
+1. **Much longer training** — 10,000+ steps at full 1-bit with LR restart
+2. **Ternary {-1, 0, +1}** — BitNet b1.58 approach, more expressive than binary
+3. **Attention distillation** — match teacher's attention patterns, not just output logits
+4. **Layer-wise progressive** — quantize one layer at a time instead of all at once

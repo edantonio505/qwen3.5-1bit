@@ -104,7 +104,9 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 | QAT v4.1 (MSE+cos, 1000 steps) | 0% | Contextual sentences ("The sun is a warm") | Only 300 steps at full 1-bit |
 | QAT v4.2 baseline (untrained + rep penalty) | 12% | 1/8 correct | Word doubling hid correct answers |
 | QAT v4.2 on Qwen3.5-2B (killed step 525) | 12% | CE=0.73 at noise=0.94 | Hybrid architecture is a blocker |
-| QAT v4.2 on Qwen3-1.7B (in progress) | TBD | Standard transformer, 6x faster | Architecture matches PrismML's choice |
+| QAT v4.2 on Qwen3-1.7B (chat only) | 0% | CE plateaus at 1.7 | Standard transformer 6x faster, but 1.7B too small? |
+| QAT v4.3 on Qwen3-1.7B (QA mix) | 12% | CE plateaus at 1.7 | QA data helps format but doesn't lower CE floor |
+| **QAT v4.3 on Qwen3-8B (NEXT)** | **TBD** | **Need A100 80GB** | **Same model PrismML used for Bonsai** |
 
 ### Key Discoveries
 
