@@ -21,7 +21,7 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 | Model | Teacher | Total VRAM | Minimum GPU | Cost |
 |---|---|---|---|---|
 | Qwen3.5-2B | BF16 (3.8 GB) | ~40 GB | 1x A40 48GB | ~$0.40/hr |
-| Qwen3-8B | 4-bit (4 GB) | ~78 GB | 1x A100 80GB | ~$2/hr |
+| Qwen3-8B | 4-bit (4 GB) | ~100 GB peak | 1x 160GB GPU | ~$2-3/hr |
 | Qwen3-8B | BF16 (16 GB) | ~100 GB | 2x L40S 48GB | ~$2/hr |
 
 **Will NOT fit on 24GB GPUs** (RTX 3090/4090) — even the 2B model needs ~40 GB.

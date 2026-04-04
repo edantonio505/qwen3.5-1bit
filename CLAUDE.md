@@ -68,74 +68,44 @@ BONSAI_MODEL=1.7B ./scripts/download_models.sh  # download first if not yet fetc
 
 Building a 1-bit quantization pipeline targeting Q1_0_g128 format (1 sign bit + FP16 scale per 128 weights = 1.125 bits/weight). PrismML's Bonsai achieves 70.5% avg benchmark at 1-bit vs 79.3% FP16 using proprietary Caltech IP.
 
-### IMMEDIATE NEXT STEP — Run on 2× GPU Server
-
-The pipeline is validated on 1.7B. Now needs Qwen3-8B on a multi-GPU server.
-
-**CRITICAL: Single A100 80GB is NOT enough.** We tried extensively on 2026-04-04 — the 8B model OOMs even with batch=1, seq=512, 8-bit Adam, and memory-optimized forward pass. The fundamental issue: teacher (6 GB) + student weights (16.5 GB) + gradients (16.5 GB) + optimizer states (16-32 GB) + forward pass intermediate tensors (~16.5 GB from ProgressiveQuantizedLinear w/w_1bit/w_eff) = ~88 GB minimum.
-
-**The code now supports multi-GPU: teacher on GPU 0, student on GPU 1.** Auto-detected via `auto_config()`.
+### Running on Cloud GPU (RunPod)
 
 ```bash
-# One command on a 2-GPU server (2× A100 80GB, 2× A40 48GB, etc.):
 git clone https://github.com/edantonio505/qwen3.5-1bit.git
 cd qwen3.5-1bit
-bash setup_and_run_8b.sh
+pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
+PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B 2>&1 | tee run.log
 ```
 
-Or manually:
-```bash
-python3 -m venv .venv
-
-# Install PyTorch matching your CUDA version first
-# Check CUDA: nvidia-smi | head -3
-# CUDA 12.4: pip install torch --index-url https://download.pytorch.org/whl/cu124
-# CUDA 12.1: pip install torch --index-url https://download.pytorch.org/whl/cu121
-# CUDA 12.8+: pip install torch (latest should work)
-.venv/bin/pip install torch transformers accelerate datasets bitsandbytes sentencepiece protobuf huggingface-hub
-
-PYTHONUNBUFFERED=1 .venv/bin/python quantize/run_v4.py \
-  --model Qwen/Qwen3-8B \
-  --use-4bit-teacher \
-  --max-steps 3000 \
-  --gen-check-interval 200 \
-  --eval-interval 500 \
-  --output-dir quantize/runs/v4.3-qwen3-8b \
-  2>&1 | tee run.log
-```
+If OOM, reduce batch/seq: `--batch-size 1 --seq-len 512`
 
 ### Quantization Format: Q1_0_g128
 
 Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` and `scale_g` is a shared FP16 scale per group of 128 weights. This is the format PrismML uses for Bonsai models.
 
-### What We Learned (Critical Knowledge — Read ALL of This)
+### What We Learned (Critical Knowledge)
 
-**Use Qwen3-8B (standard transformer). NOT Qwen3.5 (hybrid).**
-- Qwen3.5 uses GatedDeltaNet (75% linear attention with recurrent state) — fundamentally harder to quantize. Recurrent state compounds errors through time.
-- Qwen3 models are pure standard transformers — what PrismML used.
-- Training is 6x faster on standard transformers.
-- 1.7B was tested and works but CE plateaus at ~1.7. Likely needs 8B scale for the breakthrough.
+**KL divergence is WRONG for 1-bit distillation:**
+- Over 151k vocab, KL explodes from 16 to 3600+. Clamping makes it zero-gradient.
+- Use normalized MSE + cosine similarity instead. Stable, no explosion.
 
-**PTQ (post-training quantization) does NOT work at 1-bit:**
-- GPTQ with Hessian compensation, Hadamard rotation, sign-flip refinement → 0% on both 2B and 8B
-- Error compounds catastrophically through transformer layers — dead after 5 layers
-- `gptq_1bit.py` has `--eval-every N` flag for early abort detection
-- DO NOT waste time on PTQ approaches. QAT is required.
+**Teacher forcing causes generation collapse:**
+- Training loss converges perfectly (CE→0.003, cosine→0.30)
+- But model outputs `\n\n` repeated 60 times during generation
+- The model never sees its own errors during training
 
-**QAT (quantization-aware training) is required, with these specific techniques:**
-- KL divergence explodes over 151k vocab at 1-bit — use normalized MSE + cosine + CE instead
-- Teacher forcing causes generation collapse (loss converges but model outputs `\n\n`) — need scheduled sampling
-- Jumping straight to 1-bit fails — need progressive quantization (AggressiveQuantizer: 0.5→1.0)
-- Word doubling artifact ("TheThe", "is is") at 1-bit — use repetition_penalty=2.0 + no_repeat_ngram_size=3
-- Embed + LM head must stay in FP16 (critical for generation quality)
-- Training data must include short-answer QA (TriviaQA + GSM8K + custom factual pairs), not just conversations
+**Single A100 80GB is NOT enough for 8B QAT:**
+- Teacher + student + optimizer + activations peaks at ~100-130 GB
+- Use 160GB+ GPU with 4-bit teacher, or multi-GPU
+- Batch=1 seq=512 is the minimum viable config for 8B
 
-**Memory optimizations already implemented (critical for 8B):**
-- 8-bit AdamW via bitsandbytes — saves ~48 GB optimizer memory (FP32 → INT8 momentum+variance)
-- Memory-optimized `ProgressiveQuantizedLinear.forward()`: at noise_scale=1.0 (80% of training), only `w_1bit` is computed, no blending. During warmup, uses `w + noise*(w_1bit-w)` with immediate `del w_1bit`
-- Teacher activations are `.detach()`ed and cache is cleared before student forward
-- OOM failsafe: aborts after 10 consecutive OOMs instead of infinite retry loop
-- Even with ALL these optimizations, single A100 80GB still OOMs for 8B. Multi-GPU is required.
+**Memory optimizations in run_cloud.py:**
+- Student loaded on CPU first, quantized, then moved to GPU
+- Scales computed in BF16 (no FP32 temp copies)
+- Teacher logits detached and deleted before backward
+- `zero_grad(set_to_none=True)` to free gradient memory
+- 4-bit teacher via bitsandbytes NF4
+- Aborts after 3 consecutive OOMs with actionable message
 
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
@@ -148,66 +118,29 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 
 ```
 quantize/
-├── run_v4.py          # CURRENT: QAT v4.3 (progressive quant + scheduled sampling + QA data mix)
-├── run_cloud.py       # Legacy: QAT with 4-bit teacher, auto-detects GPUs/VRAM
-├── run.py             # Legacy: Local QAT with SubLN + dynamic scales
-├── gptq_1bit.py       # GPTQ 1-bit PTQ (proven insufficient, useful for analysis)
+├── run_cloud.py       # CURRENT: Cloud QAT with 4-bit teacher, auto-detects GPUs/VRAM/arch
+├── run.py             # Local QAT with SubLN + dynamic scales (for DIGITS)
 ├── quantize_lib.py    # Shared library: ProgressiveQuantizedLinear, Hadamard, learned scales, STE
-├── auto_tune.py       # Hyperparameter search loop
+├── auto_tune.py       # Hyperparameter search loop (8 configs)
 ├── evaluate.py        # Benchmark evaluation
 ├── export_gguf.py     # Export to Q1_0_g128 GGUF format
 └── train.py           # Standalone training script
 ```
 
-### v4.3 Architecture (Current)
+### Training Architecture
 
-Four key techniques combined:
-1. **AggressiveQuantizer** — starts noise at 0.5, ramps to 1.0 by 20% of steps, stays at 1.0 for 80%. Maximizes training time at full 1-bit.
-2. **Scheduled sampling** — mixes student's own predictions into training inputs (10%→30% over training) to fix exposure bias from teacher forcing.
-3. **Normalized MSE + cosine + CE loss** — distills from BF16/4-bit teacher without KL explosion. Weights: MSE 0.4, cosine 0.2, CE 0.4.
-4. **QA data mix** — 60% OpenHermes conversations + 40% short-answer QA (TriviaQA + GSM8K + custom factual pairs). Teaches model to produce concise answers, not paragraphs.
-
-Uses `ProgressiveQuantizedLinear` from `quantize_lib.py` with learned `log_scale` parameters (10x LR multiplier).
-Eval uses `repetition_penalty=2.0` + `no_repeat_ngram_size=3` to counter word-doubling artifact.
+- **Loss:** Normalized logit MSE (0.4) + cosine similarity (0.2) + CE (0.4)
+- **Teacher:** Frozen copy of base model (4-bit via bitsandbytes for 8B+)
+- **Student:** Same model with BitLinear layers (1-bit weights, learned group scales)
+- **Skipped layers:** Embedding + LM head kept in FP16
+- **Optimizer:** AdamW with separate LR for scale params (10x multiplier)
 
 ### GPU Requirements
 
-| Model | Task | Min VRAM | Notes |
-|-------|------|----------|-------|
-| Qwen3-1.7B | QAT training | 40 GB | A40 48GB works. CE plateaus at ~1.7. |
-| **Qwen3-8B** | **QAT training** | **2× 40GB+** | **Needs 2 GPUs: teacher on GPU 0, student on GPU 1. Single 80GB OOMs.** |
-| Qwen3-8B | GPTQ (PTQ) | 20 GB | Don't bother — PTQ doesn't work at 1-bit |
+| Model | Total VRAM | Example GPU |
+|-------|-----------|-------------|
+| Qwen3.5-2B | ~40 GB | A40 48GB |
+| Qwen3-8B (4-bit teacher) | ~80-100 GB | 1x 160GB or 2x48GB |
+| Qwen3.5-35B | ~380 GB | 8x A100 80GB |
 
-**Why single GPU fails for 8B QAT:** ProgressiveQuantizedLinear's forward pass creates `w`, `w_1bit`, and `w_eff` tensors — 3× student weight memory (~49.5 GB) during forward. Combined with teacher, optimizer states, and gradients, peak memory exceeds 80 GB even at batch=1.
-
-**Multi-GPU solution:** Code auto-detects 2+ GPUs in `auto_config()` and places teacher on `cuda:0` (~6 GB), student on `cuda:1` (~59 GB with optimizer+gradients). Only logits (~300 MB) transfer between GPUs per step.
-
-### Complete Results History
-
-| Approach | Model | Score | CE at 1-bit | Key Finding |
-|----------|-------|-------|-------------|-------------|
-| GPTQ PTQ | 2B/8B | 0% | N/A | PTQ dead end — error compounds through layers |
-| QAT run_cloud.py | 2B | 0% | ~0.003 train | Loss converges but generation collapses (teacher forcing) |
-| QAT v4.0 (top-K KL) | 2B hybrid | 0% | 3.5 | KL clamped at 50, drowned CE signal |
-| QAT v4.1 (MSE+cos, 1000 steps) | 2B hybrid | 0% | 1.8 | First contextual English ("The sun is a warm") |
-| QAT v4.2 on Qwen3.5-2B | 2B hybrid | 12% | 0.73* | *noise=0.94 not full 1-bit. Hybrid arch is blocker. |
-| QAT v4.2 on Qwen3-1.7B (chat only) | 1.7B standard | 0% | 1.7 plateau | Standard transformer confirmed 6x faster |
-| QAT v4.3 on Qwen3-1.7B (QA mix) | 1.7B standard | 12% | ~1.7 plateau | QA data didn't change CE trajectory at 1.7B scale |
-| QAT v4.3 on Qwen3-8B (1× A100) | 8B standard | OOM | N/A | Single 80GB GPU cannot fit 8B QAT. Needs 2 GPUs. |
-| **QAT v4.3 on Qwen3-8B (2× GPU)** | **8B standard** | **TBD** | **TBD** | **NEXT: Run on 2× A100/A40 server** |
-
-### What to Watch For During 8B Training
-
-- **CE at 1-bit entry (step ~600)**: Should be ~2.0. If much higher, increase LR.
-- **CE at step 1000**: If below 1.5, we're on track. If plateauing at 1.7+ like 1.7B, may need longer training.
-- **Generation checks**: Look for factual content, not just English words. "Paris" for France, numbers for math.
-- **Step 500 eval**: First full eval. If >12%, the approach is working.
-- **Step 1000 eval**: If >25%, this is a breakthrough. Scale up training.
-
-### If 8B Also Plateaus at CE ~1.7
-
-Fallback options (in priority order):
-1. **Much longer training** — 10,000+ steps at full 1-bit with LR restart
-2. **Ternary {-1, 0, +1}** — BitNet b1.58 approach, more expressive than binary
-3. **Attention distillation** — match teacher's attention patterns, not just output logits
-4. **Layer-wise progressive** — quantize one layer at a time instead of all at once
+**A single 80GB GPU (A100) will OOM on 8B.** Peak memory during backward pass exceeds 100GB. Use 160GB+ or multi-GPU with `device_map="auto"`.

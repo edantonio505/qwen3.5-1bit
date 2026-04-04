@@ -6,7 +6,7 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 
 ## Status
 
-**Active development.** Multiple quantization approaches tested. Current approach (v4.2) uses progressive quantization + scheduled sampling + MSE distillation. The model generates contextually relevant English at 1-bit ("The sun is a warm" for sky-related prompts) and scores 12% on simple QA with repetition penalty. Full training run (3000 steps) in progress with CE stabilized at ~0.68 at noise=0.87 — much better than prior attempts. See [Findings](#findings) below.
+**Active development.** Training loss converges but autoregressive generation still collapses. Moving to cloud GPUs (RunPod) for more compute. See [Findings](#findings) below.
 
 ## Quick Start — Training
 
@@ -14,17 +14,18 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 # Install dependencies
 pip install torch transformers datasets accelerate sentencepiece protobuf huggingface-hub
 
-# Current approach: v4.2 (progressive quant + scheduled sampling)
-PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3.5-2B
+# Local training (small model)
+PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3.5-2B
 
 # Quick validation (300 steps, ~2 hours)
-PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3.5-2B --max-steps 300
+PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3.5-2B --max-examples 3000
 
-# 8B model — one command on A100 80GB (recommended)
-git clone https://github.com/edantonio505/qwen3.5-1bit.git && cd qwen3.5-1bit && bash setup_and_run_8b.sh
+# 8B model on cloud GPU (160GB+ recommended)
+git clone https://github.com/edantonio505/qwen3.5-1bit.git && cd qwen3.5-1bit
+pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
 # Or manually:
-PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3-8B --use-4bit-teacher
+PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B
 
 # Legacy approaches (for reference)
 PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B
@@ -53,7 +54,7 @@ w_i = scale * (2 * bit_i - 1)    bit_i in {0, 1}
 
 Effective: 1.125 bits/weight. A Qwen3-8B model compresses from 16.4 GB to ~1.15 GB.
 
-### Training Approach (v4.2 — Current)
+### Training Approach
 
 | Component | Technique |
 |---|---|
@@ -70,7 +71,7 @@ Effective: 1.125 bits/weight. A Qwen3-8B model compresses from 16.4 GB to ~1.15 
 
 ```
 quantize/
-├── run_v4.py         # Current: QAT v4.2 (progressive quant + scheduled sampling + MSE)
+├── run_cloud.py      # Cloud training (multi-GPU, 4-bit teacher, auto-detect)
 ├── gptq_1bit.py      # GPTQ 1-bit PTQ (proven insufficient, useful for analysis)
 ├── run.py            # Legacy: local training with SubLN + dynamic scales
 ├── run_cloud.py      # Legacy: cloud training (multi-GPU, 4-bit teacher)
@@ -88,8 +89,10 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 | Model | Config | Total VRAM | Example GPU |
 |---|---|---|---|
 | Qwen3.5-2B | BF16 teacher + student | ~40 GB | A40 48GB |
-| Qwen3-8B | 4-bit teacher + BF16 student | ~78 GB | A100 80GB or 2x48GB |
+| Qwen3-8B | 4-bit teacher + BF16 student | ~100 GB peak | 1x 160GB or 2x48GB |
 | Qwen3.5-35B | 4-bit teacher + BF16 student | ~380 GB | 8x A100 80GB |
+
+**A single 80GB GPU (A100) will OOM on 8B.** Peak memory during backward exceeds 100GB.
 
 **Note:** 24GB GPUs (RTX 3090/4090) cannot fit even the 2B model due to optimizer states and activations.
 
@@ -97,57 +100,32 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 
 ## Findings
 
-### Approach Evolution & Results
-
-| Approach | Score | Generation Output | Key Issue |
-|----------|-------|-------------------|-----------|
-| GPTQ PTQ (gptq_1bit.py) | 0% | "FGFG" random garbage | PTQ fundamentally insufficient at 1-bit |
-| QAT v1-v3 (run_cloud.py, run.py) | 0% | `\n\n\n` empty | Exposure bias from teacher forcing |
-| QAT v4.0 (top-K KL loss) | 0% | English words ("the", "higher") | KL clamped at 50, drowned CE signal |
-| QAT v4.1 (MSE+cos, 1000 steps) | 0% | Contextual sentences ("The sun is a warm") | Only 300 steps at full 1-bit |
-| QAT v4.2 baseline (untrained + rep penalty) | 12% | 1/8 correct | Word doubling hid correct answers |
-| QAT v4.2 on Qwen3.5-2B (killed step 525) | 12% | CE=0.73 at noise=0.94 | Hybrid architecture is a blocker |
-| QAT v4.2 on Qwen3-1.7B (chat only) | 0% | CE plateaus at 1.7 | Standard transformer 6x faster, but 1.7B too small? |
-| QAT v4.3 on Qwen3-1.7B (QA mix) | 12% | CE plateaus at 1.7 | QA data helps format but doesn't lower CE floor |
-| **QAT v4.3 on Qwen3-8B (NEXT)** | **TBD** | **Need A100 80GB** | **Same model PrismML used for Bonsai** |
-
 ### Key Discoveries
 
-1. **Use standard transformers, not hybrid architectures** — Qwen3.5-2B (GatedDeltaNet hybrid) is fundamentally harder to quantize than Qwen3-1.7B/8B (standard transformer). The recurrent state in linear attention compounds quantization errors. PrismML chose standard transformer deliberately. Training is 6x faster on standard transformers.
+1. **KL divergence explodes at 1-bit** — over 151k vocab, KL goes from 16 to 3600+. Clamping makes it useless. Use normalized MSE + cosine similarity instead.
 
-2. **PTQ cannot handle 1-bit** — GPTQ with Hessian compensation, Hadamard rotation, and sign-flip refinement all fail. Error compounds catastrophically through layers (dead after 5/36 layers). Confirmed on both Qwen3.5-2B and Qwen3-8B.
+2. **Teacher forcing causes generation collapse** — training loss converges perfectly (CE→0.003, cosine→0.30) but the model outputs `\n\n` repeated 60 times during generation. The model never learns to recover from its own errors.
 
-2. **KL divergence explodes at 1-bit** — over 151k vocab, KL goes to 3600+. Even top-K KL (K=128) clamped at 50 permanently. Use normalized MSE + cosine instead.
+3. **Single A100 80GB is NOT enough for 8B QAT** — teacher + student + optimizer + activations peaks at ~100-130 GB. OOMs even at batch=1. Use 160GB+ GPU or 4-bit teacher to fit.
 
-3. **Teacher forcing causes generation collapse** — model learns perfect next-token prediction (CE→0.003) but outputs `\n\n` during generation because it never sees its own errors. Fix: scheduled sampling (mix student predictions into training inputs).
+4. **SubLN helps at initialization** — RMSNorm before each binary linear prevents hidden state collapse initially, but training pushes the model back to the `\n\n` attractor.
 
-4. **Progressive quantization prevents initialization shock** — jumping straight to 1-bit destroys the model. Annealing noise from 0.5→1.0 lets the model adapt gradually. CE stays 2x lower than non-progressive at same noise levels.
+5. **The model IS learning** — "Paris" moves from rank 134,940 to 18,016 in the logit ranking after 375 steps. It needs to reach rank 1 out of 151,669 tokens. More steps and more data should help.
 
-5. **Word doubling at 1-bit** — the model generates every word twice ("TheThe", "is is", "world world"). Adding repetition_penalty=1.3 reveals the model actually has correct knowledge hidden behind the doubling pattern.
-
-6. **Most training time should be at full 1-bit** — v4.1 wasted 700/1000 steps on noise 0.0-0.9. v4.2 starts at noise=0.5 and reaches 1.0 by 20% of steps, giving 80% of training at full 1-bit.
+6. **Embed + LM head should stay FP16** — these layers directly interface with the token space. Quantizing them breaks generation immediately.
 
 ### What Works
-- Progressive quantization (noise annealing from 0.5→1.0) keeps CE stable
-- Normalized MSE + cosine + CE distillation is stable and effective
-- Scheduled sampling (10-30% of tokens replaced with student predictions)
+- Normalized MSE + cosine + CE distillation is stable (no explosion)
 - Learned per-group scales with 10x LR multiplier
-- Repetition penalty 1.3 in eval reveals hidden knowledge
-- Model generates contextually relevant English at full 1-bit after v4.1+
+- 4-bit teacher via bitsandbytes saves ~12 GB VRAM
+- Training loss converges consistently across all runs
 
 ### What Doesn't Work Yet
-- Generation accuracy: 0% without repetition penalty, 12% with (untrained baseline)
-- Word doubling artifact not fully solved
-- Need more training steps at full 1-bit (v4.2 in progress with 2400 steps at noise=1.0)
+- Autoregressive generation still collapses to `\n\n` after training
+- Need more compute (longer training, bigger GPUs) to test whether more steps break through
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.
-
-### Potential Next Steps (if v4.2 plateaus)
-1. Try Qwen3-8B (standard transformer, more redundant — what PrismML actually used) on A100 80GB
-2. Ternary {-1, 0, +1} quantization (BitNet b1.58) — more expressive
-3. Start from v4.1/v4.2 checkpoint instead of fresh weights
-4. Attention-level distillation — match attention maps, not just output logits
 
 ---
 
