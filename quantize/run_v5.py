@@ -128,6 +128,7 @@ def run_gptq_phase(model_name, output_path, nsamples=128, seqlen=2048):
     print("=" * 60)
 
     device = torch.device("cuda:0")
+    torch.cuda.set_device(0)
     torch.cuda.reset_peak_memory_stats(0)
 
     # Load model
