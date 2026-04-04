@@ -96,11 +96,13 @@ def auto_config(info, model_name):
     is_8b = "8B" in model_name or "8b" in model_name or "9B" in model_name or "9b" in model_name
 
     if is_8b:
-        # 8B model: teacher 4-bit (~4GB) + student BF16 (~16GB) + opt (~32GB) + act (~15GB) = ~67GB
+        # 8B model: teacher 4-bit (~4GB) + student BF16 (~16GB) + opt (~32GB) + act (~15GB)
+        # Logits alone: batch * seq * 151k * 2 bytes — can spike to 10+ GB
+        # Be conservative: peak memory is 1.5-2x the static estimate
         if total >= 160:
-            return {"batch_size": 4, "grad_accum": 4, "max_seq_len": 2048, "use_4bit_teacher": True}
-        elif total >= 80:
             return {"batch_size": 2, "grad_accum": 8, "max_seq_len": 1024, "use_4bit_teacher": True}
+        elif total >= 80:
+            return {"batch_size": 1, "grad_accum": 16, "max_seq_len": 1024, "use_4bit_teacher": True}
         elif total >= 48:
             return {"batch_size": 1, "grad_accum": 16, "max_seq_len": 512, "use_4bit_teacher": True}
         else:
@@ -184,16 +186,21 @@ def replace_linears(model, skip_patterns=None):
 # ══════════════════════════════════════════════════════════
 
 def compute_loss(s_logits, t_logits, labels, alpha_mse=0.4, alpha_cos=0.2, alpha_ce=0.4):
-    # Normalized logit MSE (scale-invariant)
-    s_norm = (s_logits - s_logits.mean(-1, keepdim=True)) / s_logits.std(-1, keepdim=True).clamp(min=1e-6)
-    t_norm = (t_logits - t_logits.mean(-1, keepdim=True)) / t_logits.std(-1, keepdim=True).clamp(min=1e-6)
-    mse = F.mse_loss(s_norm, t_norm)
-
-    # Cosine similarity
+    # Cosine similarity (no extra memory — computed in-place)
     cos = 1.0 - F.cosine_similarity(s_logits, t_logits, dim=-1).mean()
 
     # Cross-entropy
     ce = F.cross_entropy(s_logits.view(-1, s_logits.size(-1)), labels.view(-1), ignore_index=-100)
+
+    # Normalized MSE — compute per-position to avoid holding full normalized copies
+    # Normalize in-place style: compute stats then MSE without materializing both full tensors
+    s_mean = s_logits.mean(-1, keepdim=True)
+    s_std = s_logits.std(-1, keepdim=True).clamp(min=1e-6)
+    t_mean = t_logits.mean(-1, keepdim=True)
+    t_std = t_logits.std(-1, keepdim=True).clamp(min=1e-6)
+    # MSE on normalized: ||((s-s_mean)/s_std) - ((t-t_mean)/t_std)||^2
+    # Expand: compute diff directly without storing both normalized tensors
+    mse = F.mse_loss((s_logits - s_mean) / s_std, ((t_logits - t_mean) / t_std).detach())
 
     total = alpha_mse * mse + alpha_cos * cos + alpha_ce * ce
     return total, mse.item(), cos.item(), ce.item()
@@ -300,6 +307,10 @@ def main():
     parser.add_argument("--output-dir", default="quantize/runs/cloud")
     parser.add_argument("--no-4bit-teacher", action="store_true")
     parser.add_argument("--gen-check-interval", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override auto-detected batch size")
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="Override auto-detected max sequence length")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -317,6 +328,10 @@ def main():
 
     # Auto-configure based on hardware
     hw_config = auto_config(sys_info, args.model)
+    if args.batch_size is not None:
+        hw_config["batch_size"] = args.batch_size
+    if args.seq_len is not None:
+        hw_config["max_seq_len"] = args.seq_len
     use_4bit = hw_config["use_4bit_teacher"] and not args.no_4bit_teacher
 
     print(f"\n  Auto-configured:")
@@ -431,13 +446,19 @@ def main():
 
             try:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    # Teacher forward — detach and free intermediate activations
                     with torch.no_grad():
-                        t_logits = teacher(**batch).logits
+                        t_out = teacher(**batch)
+                        t_logits = t_out.logits.detach()
                         if t_logits.device != device:
                             t_logits = t_logits.to(device)
+                        del t_out
+                        torch.cuda.empty_cache()
 
+                    # Student forward
                     s_logits = student(**batch).logits
                     loss, mse_v, cos_v, ce_v = compute_loss(s_logits, t_logits, labels)
+                    del t_logits  # free teacher logits before backward
                     loss = loss / hw_config["grad_accum"]
 
                 loss.backward()
