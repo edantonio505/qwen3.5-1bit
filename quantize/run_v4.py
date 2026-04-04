@@ -846,43 +846,53 @@ def main():
 
                 # Quick generation check
                 if step % args.gen_check_interval == 0:
-                    student.eval()
-                    if not use_bitlinear:
-                        set_progressive_noise(student, 1.0)
-                    torch.cuda.empty_cache()
-                    c1, _, _ = generate_answer(student, tok, "Capital of France? One word.")
-                    c2, _, _ = generate_answer(student, tok, "2+2=? Just the number.")
-                    c3, _, _ = generate_answer(student, tok, "What color is the sky?")
-                    r1 = " REP" if detect_repetition(c1) else ""
-                    r2 = " REP" if detect_repetition(c2) else ""
-                    r3 = " REP" if detect_repetition(c3) else ""
-                    print(f"  >> France: {(c1 or '[EMPTY]')[:40]}{r1} | "
-                          f"2+2: {(c2 or '[EMPTY]')[:40]}{r2} | "
-                          f"Sky: {(c3 or '[EMPTY]')[:40]}{r3}")
-                    if not use_bitlinear:
-                        set_progressive_noise(student, noise)
-                    student.train()
-                    torch.cuda.empty_cache()
+                    try:
+                        student.eval()
+                        if not use_bitlinear:
+                            set_progressive_noise(student, 1.0)
+                        torch.cuda.synchronize()  # catch async CUDA errors before gen
+                        torch.cuda.empty_cache()
+                        c1, _, _ = generate_answer(student, tok, "Capital of France? One word.")
+                        c2, _, _ = generate_answer(student, tok, "2+2=? Just the number.")
+                        c3, _, _ = generate_answer(student, tok, "What color is the sky?")
+                        r1 = " REP" if detect_repetition(c1) else ""
+                        r2 = " REP" if detect_repetition(c2) else ""
+                        r3 = " REP" if detect_repetition(c3) else ""
+                        print(f"  >> France: {(c1 or '[EMPTY]')[:40]}{r1} | "
+                              f"2+2: {(c2 or '[EMPTY]')[:40]}{r2} | "
+                              f"Sky: {(c3 or '[EMPTY]')[:40]}{r3}")
+                    except (RuntimeError, torch.cuda.CudaError) as e:
+                        print(f"  >> Gen check failed: {e}")
+                    finally:
+                        if not use_bitlinear:
+                            set_progressive_noise(student, noise)
+                        student.train()
+                        torch.cuda.empty_cache()
 
                 # Full eval
                 if step % args.eval_interval == 0:
-                    if not use_bitlinear:
-                        set_progressive_noise(student, 1.0)
-                    score = run_eval(student, tok, f"step {step}/{total_steps}")
-                    if score > best_score:
-                        best_score = score
-                        best_step = step
-                        print(f"  ★ New best: {score:.0f}% at step {step}")
-                        # Save checkpoint
-                        ckpt_dir = Path(args.output_dir) / "best"
-                        ckpt_dir.mkdir(parents=True, exist_ok=True)
-                        student.save_pretrained(ckpt_dir)
-                        tok.save_pretrained(ckpt_dir)
-                        with open(ckpt_dir / "training_state.json", "w") as f:
-                            json.dump({"step": step, "score": score, "noise": noise}, f)
-                    if not use_bitlinear:
-                        set_progressive_noise(student, noise)
-                    student.train()
+                    try:
+                        if not use_bitlinear:
+                            set_progressive_noise(student, 1.0)
+                        torch.cuda.synchronize()
+                        score = run_eval(student, tok, f"step {step}/{total_steps}")
+                        if score > best_score:
+                            best_score = score
+                            best_step = step
+                            print(f"  ★ New best: {score:.0f}% at step {step}")
+                            ckpt_dir = Path(args.output_dir) / "best"
+                            ckpt_dir.mkdir(parents=True, exist_ok=True)
+                            student.save_pretrained(ckpt_dir)
+                            tok.save_pretrained(ckpt_dir)
+                            with open(ckpt_dir / "training_state.json", "w") as f:
+                                json.dump({"step": step, "score": score, "noise": noise}, f)
+                    except (RuntimeError, torch.cuda.CudaError) as e:
+                        print(f"  >> Eval failed: {e}")
+                        score = 0
+                    finally:
+                        if not use_bitlinear:
+                            set_progressive_noise(student, noise)
+                        student.train()
 
                 if step >= total_steps:
                     break

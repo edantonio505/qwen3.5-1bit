@@ -146,6 +146,22 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 - If using PyTorch 2.4.x, run_v4.py includes a monkey-patch for this
 - Symptom: `AttributeError: 'Qwen3ForCausalLM' object has no attribute 'set_submodule'`
 
+**CUDA illegal memory access during generation checks:**
+- Async CUDA errors from training surface at `torch.cuda.empty_cache()` / `synchronize()`
+- Happens at gen check boundaries (step 200, 400, etc.) when switching from train→eval→generate
+- **Fix:** Wrap gen checks and evals in try/except, add `torch.cuda.synchronize()` before gen
+- `CUDA_LAUNCH_BLOCKING=1` env var makes kernels synchronous (pinpoints errors, ~30% slower)
+- After fix, training continues even if gen check fails
+
+**v4.3 training trajectory (Qwen3-8B, 2x A100 80GB):**
+- Step 1→75: loss 8.6→4.2 (warmup, LR ramping)
+- Step 75→150: loss 4.2→2.6 (warmup completing)
+- Step 150→225: loss 2.6→2.0 (post-warmup, still declining — good sign)
+- Step 200 gen check: gibberish → English word fragments ("Nowonenatorinaeseinged up down away did")
+- Generation went from random tokens to real English words in 200 steps — model IS learning
+- But still incoherent — no correct answers yet. Need to watch step 400-500 for semantic progress.
+- CE: 19→8.8→5.1→3.8 — consistent improvement, no plateau yet
+
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
 - True binary {-d, +d}, Q1_0_g128 applied to ALL layers including embed + LM head

@@ -139,18 +139,35 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 - Gradient checkpointing essential for 8B
 
 ### What Doesn't Work Yet
-- Autoregressive generation still collapses to `\n\n` after training (under test in v4.3)
+- Generation produces English word fragments but not correct answers (as of step 225)
 - ProgressiveQuantizedLinear too memory-intensive for 8B (use BitLinear instead)
 - Progressive noise schedule incompatible with 8B memory budget (skip directly to 1-bit)
+- CUDA async errors crash gen checks — need try/except + synchronize wrappers
 
 ### v4.3 Run (In Progress — 2026-04-04)
 - **Setup:** 2x A100 80GB, Qwen3-8B, 4-bit teacher, BitLinear student
 - **Config:** batch=1, seq=512, grad_accum=16, 8-bit AdamW, lr=5e-6 (scales: 5e-5)
 - **Data:** 35,160 examples (30k OpenHermes chat + 5.1k QA)
 - **Schedule:** 3000 steps, scheduled sampling 10%→30%
-- **Early results:** Loss declining (8.62→8.27 in first 3 steps), GPU stable at 33/78 GB, no OOM
 - **Teacher baseline:** 8/8 = 100% on factual eval
 - **Student baseline (untrained 1-bit):** 0/8 = 0% (gibberish)
+
+**Loss trajectory:**
+
+| Step | Loss | CE | Generation |
+|------|------|----|------------|
+| 1 | 8.62 | 19.0 | `illonillianillery` (random tokens) |
+| 75 | 4.24 | 8.8 | — |
+| 150 | 2.63 | 5.1 | — |
+| 200 | — | — | `Nowonenatorinaeseinged up down away did` (English fragments!) |
+| 225 | 2.05 | 3.8 | — |
+
+**Key observations:**
+- Loss still declining at step 225 (no plateau yet) — strong go signal
+- Generation evolved from random gibberish to English word fragments in 200 steps
+- CUDA illegal memory access at step 200 gen check (async error) — fixed with try/except + synchronize
+- GPU stable at 33/78 GB throughout, no OOM
+- `CUDA_LAUNCH_BLOCKING=1` needed for reliable gen checks (~30% slower but no crashes)
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.

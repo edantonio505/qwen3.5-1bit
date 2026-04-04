@@ -83,6 +83,8 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 | Logits not freed before backward | Peak memory too high | `del s_logits, t_logits` before `loss.backward()` |
 | Gradients not freed after step | Memory stays high between steps | `zero_grad(set_to_none=True)` |
 | KV cache fragments | OOM on generation checks | `torch.cuda.empty_cache()` before/after eval |
+| CUDA async errors at gen checks | `illegal memory access` at `empty_cache()` | try/except + `torch.cuda.synchronize()` before gen, `CUDA_LAUNCH_BLOCKING=1` |
+| 8-bit AdamW lazy init memory spike | 16 GB jump at step 2 (states created on first `opt.step()`) | Expected behavior — budget for it; without 8-bit would be 32 GB |
 
 ### What we tried on DIGITS (128GB, GB10)
 
@@ -108,7 +110,11 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 - 2x A100 80GB, Qwen3-8B, BitLinear, 4-bit teacher
 - 3000 steps, batch=1, seq=512, grad_accum=16, 8-bit AdamW
 - 35k examples (30k chat + 5k QA), scheduled sampling 10%→30%
-- Early: loss 8.62→8.27 (3 steps), GPU stable at 33/78 GB, no OOM
+- Loss: 8.6→4.2→2.6→2.0 (step 225), CE: 19→3.8, still declining
+- Step 200 gen: random gibberish → English word fragments (progress!)
+- CUDA crash at step 200 fixed with try/except + synchronize
+- GPU stable at 33/78 GB, no OOM
+- Running with `CUDA_LAUNCH_BLOCKING=1` for reliability (~30% slower)
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically
