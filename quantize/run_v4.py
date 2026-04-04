@@ -103,17 +103,23 @@ def detect_system():
 
 def auto_config(info, model_name, use_4bit_teacher):
     total = info["total_vram_gb"]
+    num_gpus = info["num_gpus"]
+    per_gpu = info["per_gpu_vram_gb"]
     is_8b = any(s in model_name for s in ["8B", "8b", "9B", "9b"])
 
     if is_8b:
-        if total >= 160:
+        if num_gpus >= 2 and min(per_gpu[:2]) >= 40:
+            # 2+ GPUs: teacher on GPU 0, student on GPU 1
+            # Student gets full GPU — can use batch=2
+            return {"batch_size": 2, "grad_accum": 8, "max_seq_len": 1024,
+                    "multi_gpu": True}
+        elif total >= 160:
             return {"batch_size": 4, "grad_accum": 4, "max_seq_len": 2048}
         elif total >= 80:
-            return {"batch_size": 2, "grad_accum": 8, "max_seq_len": 1024}
+            return {"batch_size": 1, "grad_accum": 16, "max_seq_len": 1024}
         else:
             return {"batch_size": 1, "grad_accum": 16, "max_seq_len": 512}
     else:
-        # 2B/4B: teacher BF16 (~4GB) + student BF16 (~4GB) + opt (~8GB) + act (~15GB) ≈ 31GB
         if total >= 80:
             return {"batch_size": 4, "grad_accum": 4, "max_seq_len": 1024}
         elif total >= 40:
@@ -503,7 +509,14 @@ def main():
         return
 
     hw = auto_config(sys_info, args.model, args.use_4bit_teacher)
-    device = torch.device("cuda")
+    multi_gpu = hw.pop("multi_gpu", False)
+
+    if multi_gpu:
+        teacher_device = torch.device("cuda:0")
+        student_device = torch.device("cuda:1")
+        print(f"\n  Multi-GPU: teacher→GPU 0, student→GPU 1")
+    else:
+        teacher_device = student_device = torch.device("cuda")
 
     print(f"\n  Config:")
     print(f"    Model:     {args.model}")
@@ -512,6 +525,8 @@ def main():
     print(f"    Teacher:   {'4-bit' if args.use_4bit_teacher else 'BF16'}")
     print(f"    LR:        {args.lr} (scales: {args.lr * 10})")
     print(f"    Epochs:    {args.epochs}")
+    if multi_gpu:
+        print(f"    GPUs:      teacher=cuda:0, student=cuda:1")
 
     # ── Tokenizer ──
     print("\n[1/5] Tokenizer...")
@@ -530,14 +545,14 @@ def main():
         teacher = AutoModelForCausalLM.from_pretrained(
             args.model, quantization_config=bnb_config,
             trust_remote_code=True, attn_implementation="sdpa",
-            device_map="auto" if sys_info["num_gpus"] > 1 else None,
+            device_map={"": teacher_device.index or 0},
         )
     else:
         teacher = AutoModelForCausalLM.from_pretrained(
             args.model, dtype=torch.bfloat16,
             trust_remote_code=True, attn_implementation="sdpa",
         )
-        teacher.to(device)
+        teacher.to(teacher_device)
 
     teacher.eval()
     for p in teacher.parameters():
@@ -555,7 +570,7 @@ def main():
 
     n_replaced = replace_linears_progressive(student,
         skip_patterns=["norm", "layernorm", "rmsnorm", "embed", "lm_head"])
-    student.to(device).train()
+    student.to(student_device).train()
     sgb = sum(p.numel() * p.element_size() for p in student.parameters()) / 1e9
     print(f"  Student: {sgb:.2f} GB")
 
@@ -617,7 +632,12 @@ def main():
     groups = [{"params": other_p, "lr": args.lr}]
     if scale_p:
         groups.append({"params": scale_p, "lr": args.lr * 10})
-    opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.01)
+    try:
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit(groups, betas=(0.9, 0.95), weight_decay=0.01)
+        print("  Using 8-bit AdamW (saves ~16 GB optimizer memory)")
+    except ImportError:
+        opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.01)
     sched = get_cosine_schedule_with_warmup(opt, warmup, total_steps)
 
     print(f"\n  Training plan:")
@@ -632,14 +652,12 @@ def main():
     best_score = baseline
     best_step = 0
     step = 0
+    oom_count = 0
     t0 = time.time()
     log_loss = log_dist = log_ce = log_n = 0
 
     for epoch in range(args.epochs):
         for bi, batch in enumerate(loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch.pop("labels")
-
             # Update progressive quantization noise
             noise = prog.get_noise_scale(step)
             set_progressive_noise(student, noise)
@@ -648,27 +666,32 @@ def main():
             sr = get_sampling_ratio(step, total_steps)
 
             try:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    # Teacher forward (frozen)
-                    with torch.no_grad():
-                        t_logits = teacher(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                        ).logits
-                        if t_logits.device != device:
-                            t_logits = t_logits.to(device)
+                # Teacher forward on teacher_device (frozen, no grad)
+                with torch.no_grad():
+                    t_batch = {k: v.to(teacher_device) for k, v in batch.items() if k != "labels"}
+                    with torch.amp.autocast(teacher_device.type, dtype=torch.bfloat16):
+                        t_out = teacher(**t_batch)
+                    t_logits = t_out.logits.detach().to(student_device)
+                    del t_out, t_batch
+                    if multi_gpu:
+                        torch.cuda.empty_cache()
 
+                # Student forward + backward on student_device
+                s_batch = {k: v.to(student_device) for k, v in batch.items()}
+                labels = s_batch.pop("labels")
+
+                with torch.amp.autocast(student_device.type, dtype=torch.bfloat16):
                     # Scheduled sampling: mix in student's own predictions
                     if sr > 0 and student.training:
                         mixed_ids = mix_with_student_predictions(
-                            student, batch["input_ids"], batch["attention_mask"], sr)
+                            student, s_batch["input_ids"], s_batch["attention_mask"], sr)
                     else:
-                        mixed_ids = batch["input_ids"]
+                        mixed_ids = s_batch["input_ids"]
 
                     # Student forward
                     s_logits = student(
                         input_ids=mixed_ids,
-                        attention_mask=batch["attention_mask"],
+                        attention_mask=s_batch["attention_mask"],
                     ).logits
 
                     loss, dist_v, ce_v, alpha = compute_loss(
@@ -676,11 +699,15 @@ def main():
                     loss = loss / hw["grad_accum"]
 
                 loss.backward()
+                del s_batch, t_logits
 
             except torch.cuda.OutOfMemoryError:
-                print(f"  OOM at step {step}! Clearing cache...")
+                oom_count += 1
+                print(f"  OOM at step {step}! Clearing cache... (#{oom_count})")
                 torch.cuda.empty_cache()
                 opt.zero_grad()
+                if oom_count >= 10:
+                    raise RuntimeError(f"OOM {oom_count}x — reduce batch_size or seq_len")
                 continue
 
             log_loss += loss.item() * hw["grad_accum"]
@@ -790,7 +817,8 @@ def main():
 
     del teacher, student
     gc.collect()
-    torch.cuda.empty_cache()
+    for i in range(torch.cuda.device_count()):
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

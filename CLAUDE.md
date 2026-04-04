@@ -68,24 +68,32 @@ BONSAI_MODEL=1.7B ./scripts/download_models.sh  # download first if not yet fetc
 
 Building a 1-bit quantization pipeline targeting Q1_0_g128 format (1 sign bit + FP16 scale per 128 weights = 1.125 bits/weight). PrismML's Bonsai achieves 70.5% avg benchmark at 1-bit vs 79.3% FP16 using proprietary Caltech IP.
 
-### IMMEDIATE NEXT STEP — Run on A100 80GB
+### IMMEDIATE NEXT STEP — Run on 2× GPU Server
 
-The pipeline is validated on 1.7B. Now needs Qwen3-8B on A100 80GB (the exact model PrismML used for Bonsai).
+The pipeline is validated on 1.7B. Now needs Qwen3-8B on a multi-GPU server.
+
+**CRITICAL: Single A100 80GB is NOT enough.** We tried extensively on 2026-04-04 — the 8B model OOMs even with batch=1, seq=512, 8-bit Adam, and memory-optimized forward pass. The fundamental issue: teacher (6 GB) + student weights (16.5 GB) + gradients (16.5 GB) + optimizer states (16-32 GB) + forward pass intermediate tensors (~16.5 GB from ProgressiveQuantizedLinear w/w_1bit/w_eff) = ~88 GB minimum.
+
+**The code now supports multi-GPU: teacher on GPU 0, student on GPU 1.** Auto-detected via `auto_config()`.
 
 ```bash
-# On new A100 80GB server:
+# One command on a 2-GPU server (2× A100 80GB, 2× A40 48GB, etc.):
 git clone https://github.com/edantonio505/qwen3.5-1bit.git
 cd qwen3.5-1bit
+bash setup_and_run_8b.sh
+```
+
+Or manually:
+```bash
 python3 -m venv .venv
 
-# IMPORTANT: Install PyTorch matching your CUDA version first
+# Install PyTorch matching your CUDA version first
 # Check CUDA: nvidia-smi | head -3
-# For CUDA 12.4: pip install torch --index-url https://download.pytorch.org/whl/cu124
-# For CUDA 12.1: pip install torch --index-url https://download.pytorch.org/whl/cu121
-# For CUDA 12.8+: pip install torch (latest should work)
+# CUDA 12.4: pip install torch --index-url https://download.pytorch.org/whl/cu124
+# CUDA 12.1: pip install torch --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.8+: pip install torch (latest should work)
 .venv/bin/pip install torch transformers accelerate datasets bitsandbytes sentencepiece protobuf huggingface-hub
 
-# Run the 8B training (needs bitsandbytes for 4-bit teacher)
 PYTHONUNBUFFERED=1 .venv/bin/python quantize/run_v4.py \
   --model Qwen/Qwen3-8B \
   --use-4bit-teacher \
@@ -121,6 +129,13 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 - Word doubling artifact ("TheThe", "is is") at 1-bit — use repetition_penalty=2.0 + no_repeat_ngram_size=3
 - Embed + LM head must stay in FP16 (critical for generation quality)
 - Training data must include short-answer QA (TriviaQA + GSM8K + custom factual pairs), not just conversations
+
+**Memory optimizations already implemented (critical for 8B):**
+- 8-bit AdamW via bitsandbytes — saves ~48 GB optimizer memory (FP32 → INT8 momentum+variance)
+- Memory-optimized `ProgressiveQuantizedLinear.forward()`: at noise_scale=1.0 (80% of training), only `w_1bit` is computed, no blending. During warmup, uses `w + noise*(w_1bit-w)` with immediate `del w_1bit`
+- Teacher activations are `.detach()`ed and cache is cleared before student forward
+- OOM failsafe: aborts after 10 consecutive OOMs instead of infinite retry loop
+- Even with ALL these optimizations, single A100 80GB still OOMs for 8B. Multi-GPU is required.
 
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
@@ -160,8 +175,12 @@ Eval uses `repetition_penalty=2.0` + `no_repeat_ngram_size=3` to counter word-do
 | Model | Task | Min VRAM | Notes |
 |-------|------|----------|-------|
 | Qwen3-1.7B | QAT training | 40 GB | A40 48GB works. CE plateaus at ~1.7. |
-| **Qwen3-8B** | **QAT training** | **78 GB** | **A100 80GB with 4-bit teacher. THIS IS THE TARGET.** |
+| **Qwen3-8B** | **QAT training** | **2× 40GB+** | **Needs 2 GPUs: teacher on GPU 0, student on GPU 1. Single 80GB OOMs.** |
 | Qwen3-8B | GPTQ (PTQ) | 20 GB | Don't bother — PTQ doesn't work at 1-bit |
+
+**Why single GPU fails for 8B QAT:** ProgressiveQuantizedLinear's forward pass creates `w`, `w_1bit`, and `w_eff` tensors — 3× student weight memory (~49.5 GB) during forward. Combined with teacher, optimizer states, and gradients, peak memory exceeds 80 GB even at batch=1.
+
+**Multi-GPU solution:** Code auto-detects 2+ GPUs in `auto_config()` and places teacher on `cuda:0` (~6 GB), student on `cuda:1` (~59 GB with optimizer+gradients). Only logits (~300 MB) transfer between GPUs per step.
 
 ### Complete Results History
 
@@ -174,7 +193,8 @@ Eval uses `repetition_penalty=2.0` + `no_repeat_ngram_size=3` to counter word-do
 | QAT v4.2 on Qwen3.5-2B | 2B hybrid | 12% | 0.73* | *noise=0.94 not full 1-bit. Hybrid arch is blocker. |
 | QAT v4.2 on Qwen3-1.7B (chat only) | 1.7B standard | 0% | 1.7 plateau | Standard transformer confirmed 6x faster |
 | QAT v4.3 on Qwen3-1.7B (QA mix) | 1.7B standard | 12% | ~1.7 plateau | QA data didn't change CE trajectory at 1.7B scale |
-| **QAT v4.3 on Qwen3-8B** | **8B standard** | **TBD** | **TBD** | **NEXT: Run on A100 80GB** |
+| QAT v4.3 on Qwen3-8B (1× A100) | 8B standard | OOM | N/A | Single 80GB GPU cannot fit 8B QAT. Needs 2 GPUs. |
+| **QAT v4.3 on Qwen3-8B (2× GPU)** | **8B standard** | **TBD** | **TBD** | **NEXT: Run on 2× A100/A40 server** |
 
 ### What to Watch For During 8B Training
 

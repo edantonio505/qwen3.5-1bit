@@ -222,23 +222,24 @@ class ProgressiveQuantizedLinear(nn.Module):
 
     def forward(self, x):
         w = self.weight
-        flat = w.reshape(-1, GROUP_SIZE)
 
         if self.log_scales is not None:
             scales = torch.exp(self.log_scales)
         else:
-            scales = flat.detach().abs().mean(dim=1, keepdim=True)
+            flat = w.detach().reshape(-1, GROUP_SIZE)
+            scales = flat.abs().mean(dim=1, keepdim=True)
 
-        # 1-bit quantized version
-        w_1bit = STEQuantize1Bit.apply(w, scales)
-
-        # Blend: progressive noise injection
+        # At full 1-bit (noise_scale=1.0), skip blending entirely
         if self.noise_scale >= 1.0:
-            w_eff = w_1bit
+            w_eff = STEQuantize1Bit.apply(w, scales)
         elif self.noise_scale <= 0.0:
             w_eff = w
         else:
-            w_eff = (1.0 - self.noise_scale) * w + self.noise_scale * w_1bit
+            # Blend in-place: w_eff = w + noise_scale * (w_1bit - w)
+            # This avoids holding w, w_1bit, and w_eff simultaneously
+            w_1bit = STEQuantize1Bit.apply(w, scales)
+            w_eff = w + self.noise_scale * (w_1bit - w)
+            del w_1bit
 
         return F.linear(x, w_eff, self.bias)
 

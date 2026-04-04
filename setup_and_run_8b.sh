@@ -58,10 +58,17 @@ echo "[5/5] Verifying..."
 .venv/bin/python -c "
 import torch
 assert torch.cuda.is_available(), 'CUDA not available!'
-name = torch.cuda.get_device_name(0)
-vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-print(f'  GPU: {name} ({vram:.0f} GB)')
-assert vram >= 70, f'Need 80GB+ VRAM, got {vram:.0f} GB'
+n = torch.cuda.device_count()
+total = 0
+for i in range(n):
+    name = torch.cuda.get_device_name(i)
+    vram = torch.cuda.get_device_properties(i).total_memory / 1e9
+    total += vram
+    print(f'  GPU {i}: {name} ({vram:.0f} GB)')
+print(f'  Total: {total:.0f} GB across {n} GPU(s)')
+assert total >= 80, f'Need 80GB+ total VRAM, got {total:.0f} GB'
+if n >= 2:
+    print('  Mode: multi-GPU (teacher=GPU0, student=GPU1)')
 print('  Ready!')
 "
 
