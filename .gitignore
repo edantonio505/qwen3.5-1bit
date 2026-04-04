@@ -217,3 +217,4 @@ mlx/
 .webui_secret_key
 *.tar.gz
 *.zip
+quantize/runs/
