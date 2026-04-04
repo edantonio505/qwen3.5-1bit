@@ -99,12 +99,15 @@ class STE1Bit(torch.autograd.Function):
         flat = weight.reshape(-1, GROUP_SIZE)
         signs = flat.sign()
         signs[signs == 0] = 1.0
-        ctx.save_for_backward(signs)
+        # Save signs as int8 (1 byte) instead of BF16 (2 bytes) — saves 50% memory
+        # For 8B model: 16.4 GB -> 8.2 GB saved tensors
+        ctx.save_for_backward(signs.to(torch.int8))
         return (scales * signs).reshape(shape)
 
     @staticmethod
     def backward(ctx, grad):
-        signs, = ctx.saved_tensors
+        signs_int8, = ctx.saved_tensors
+        signs = signs_int8.to(grad.dtype)
         flat_g = grad.reshape(-1, GROUP_SIZE)
         scale_grad = (flat_g * signs).sum(dim=1, keepdim=True)
         return grad, scale_grad
@@ -423,17 +426,22 @@ def main():
 
             try:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    # Teacher forward
+                    # Teacher forward — extract logits, free everything else
                     with torch.no_grad():
-                        t_logits = teacher(**batch).logits.detach()
+                        t_out = teacher(**batch)
+                        t_logits = t_out.logits.detach()
+                        del t_out  # free KV cache, hidden states, etc.
                         if t_logits.device != device:
                             t_logits = t_logits.to(device)
 
                     # Student forward
-                    s_logits = student(**batch).logits
+                    s_out = student(**batch)
+                    s_logits = s_out.logits
+                    del s_out  # free everything except logits
+
                     loss, mse_v, cos_v, ce_v = compute_loss(s_logits, t_logits, labels)
 
-                    # Free logits before backward
+                    # Free logits before backward — backward only needs the loss graph
                     del t_logits, s_logits
                     loss = loss / hw["grad_accum"]
 
@@ -483,12 +491,15 @@ def main():
                     log_loss = log_mse = log_cos = log_ce = log_n = 0
 
                 if step % args.gen_check_interval == 0:
+                    # Free memory before generation (KV cache needs contiguous blocks)
+                    torch.cuda.empty_cache()
                     student.eval()
                     c1, _ = generate_answer(student, tok, "Capital of France? One word.")
                     c2, _ = generate_answer(student, tok, "2+2=? Just the number.")
                     c3, _ = generate_answer(student, tok, "What color is the sky?")
                     print(f"  >> France: {c1 or '[EMPTY]'} | 2+2: {c2 or '[EMPTY]'} | Sky: {c3 or '[EMPTY]'}")
                     student.train()
+                    torch.cuda.empty_cache()  # clean up KV cache fragments
 
                 if step >= total_steps:
                     break
@@ -511,7 +522,11 @@ def main():
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    torch.save(student.state_dict(), out / "model.pt")
+    # Save on CPU to avoid doubling GPU memory
+    print("  Saving model (offloading to CPU)...")
+    cpu_state = {k: v.cpu() for k, v in student.state_dict().items()}
+    torch.save(cpu_state, out / "model.pt")
+    del cpu_state
     tok.save_pretrained(out)
     with open(out / "result.json", "w") as f:
         json.dump({"teacher": teacher_score, "final": final,
