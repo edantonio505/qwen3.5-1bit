@@ -257,11 +257,15 @@ quantize/
 | Model | Config | Total VRAM | Example GPU |
 |-------|--------|-----------|-------------|
 | Qwen3.5-2B | BF16 teacher + ProgressiveQuantized student | ~40 GB | A40 48GB |
-| Qwen3-8B | 4-bit teacher (GPU 0) + BitLinear student (GPU 1) | ~78 GB peak per GPU | 2x A100 80GB |
-| Qwen3-8B | 4-bit teacher + BitLinear student (single GPU) | ~85 GB peak | 1x H100 96GB or 1x A100 160GB |
+| Qwen3-8B | 4-bit teacher + split student (v5.3) | ~50-60 GB peak/GPU | 2x A100 80GB |
+| Qwen3-8B | 4-bit teacher + student single GPU (v5.1, OOM) | ~84 GB peak | OOM on 80GB |
 | Qwen3.5-35B | 4-bit teacher + student | ~380 GB | 8x A100 80GB |
 
-**A single 80GB GPU (A100) will OOM on 8B.** Use 2x A100 80GB (teacher/student split) or 1x 160GB+.
+**v5.3 GPU layout (recommended):** Split student across both GPUs using `accelerate.dispatch_model()`.
+Teacher (6.4 GB) shares GPU 0 with first half of student layers. On-policy distillation fits because
+each GPU only holds half the student's activations during forward pass.
+
+**Student on single GPU will OOM with on-policy distillation** — two forward passes (rollout + main) exceed 80 GB.
 
 ### Operating Guide (for Claude Code sessions)
 
@@ -270,11 +274,30 @@ True binary only — NEVER ternary {-1,0,+1}.
 
 **When resuming on a new server:**
 1. Check GPU setup: `nvidia-smi` — need 2x 80GB+ GPUs
-2. Check deps: `python3 -c "import torch, transformers, bitsandbytes; print('OK')"`
+2. Check deps: `python3 -c "import torch, transformers, bitsandbytes, accelerate; print('OK')"`
 3. Check if GPTQ checkpoint exists: `ls quantize/runs/v5-qwen3-8b/gptq_checkpoint/group_scales.pt`
 4. If yes: launch with `--skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint`
 5. If no: launch without those flags (runs ~15 min GPTQ Phase 1 first)
-6. Monitor: `tail -f run_v5.1.log`
+6. Monitor: `tail -f run_v5.3.log`
+
+**Current best launch command (v5.3):**
+```bash
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
+  python3 quantize/run_v5.py \
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
+    --gen-check-interval 100 --eval-interval 500 \
+    --output-dir quantize/runs/v5.3-qwen3-8b \
+    --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
+    --unlikelihood-weight 0.1 --on-policy-fraction 0.2 --on-policy-len 64 --ste-clip 1.0 \
+    2>&1 | tee run_v5.3.log
+```
+
+**GPU layout (v5.3):**
+- Teacher (4-bit NF4, 6.4 GB) on GPU 0
+- Student layers 0-17 + embed on GPU 0 (~8 GB weights + optimizer/grads)
+- Student layers 18-35 + norm + lm_head on GPU 1 (~8 GB weights + optimizer/grads)
+- Peak: ~50-60 GB per GPU (vs 84 GB OOM when student was on single GPU)
+- Uses `accelerate.dispatch_model()` for automatic tensor routing between GPUs
 
 **Go/no-go decision points:**
 - Step 75: loss should be < 5.0 and declining
@@ -286,12 +309,15 @@ True binary only — NEVER ternary {-1,0,+1}.
 **What has already failed (don't repeat):**
 - v4.3: naive sign(w) init → loss converges to 1.9, gen collapses (killed step 300)
 - v5.0: GPTQ binary values as weights → flat gradients, worse than v4.3 (killed step 3)
+- v5.1: on-policy OOM'd at step 25 — student on single GPU couldn't fit 2 forward passes
+- v5.2: killed before results — replaced by v5.3 with split student
 - ProgressiveQuantizedLinear on 8B → OOM. Use BitLinear only.
 - KL divergence → explodes to 3600+. Use normalized MSE + cosine instead.
+- Student on single GPU + on-policy → OOM at 84 GB. Must split student across both GPUs.
 - 35k examples is 400x too little data. Scale data if current approach fails.
 
-**Fallback plan (if v5.1 fails):**
-1. Scale data 100x (synthetic from teacher, OneBit-style)
+**Fallback plan (if v5.3 fails):**
+1. Scale data 100x (synthetic from teacher, OneBit-style: 100k examples, 50 epochs → ~10B tokens)
 2. OneBit SVID decomposition: W = sign(W) * outer(a, b)
 3. Tanh progressive schedule (BinaryLLM, arXiv 2508.06974)
 4. Curriculum bit-width: 4-bit → 2-bit → 1-bit

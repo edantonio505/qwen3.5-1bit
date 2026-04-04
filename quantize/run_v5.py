@@ -588,7 +588,11 @@ def collate(batch, pad_id):
 # ══════════════════════════════════════════════════════════
 
 def generate_answer(model, tokenizer, prompt, max_tokens=60):
-    device = next(model.parameters()).device
+    # With split models, use the device of the embedding layer (input device)
+    if hasattr(model, 'hf_device_map'):
+        device = torch.device(f"cuda:{model.hf_device_map.get('model.embed_tokens', 0)}")
+    else:
+        device = next(model.parameters()).device
     msgs = [{"role": "system", "content": "Be concise."},
             {"role": "user", "content": prompt}]
     text = tokenizer.apply_chat_template(msgs, tokenize=False,
@@ -720,12 +724,16 @@ def main():
     if args.seq_len is not None:
         hw["max_seq_len"] = args.seq_len
 
+    # GPU layout: teacher on GPU 0, student SPLIT across both GPUs
+    # Teacher is tiny (6.4 GB in 4-bit), student needs ~80+ GB
+    # Splitting student across 2x80 GB gives ~73 GB headroom per GPU
+    teacher_device = torch.device("cuda:0")
     if multi_gpu:
-        teacher_device = torch.device("cuda:0")
-        student_device = torch.device("cuda:1")
-        print(f"\n  Multi-GPU: teacher→GPU 0, student→GPU 1")
+        # Student input device = GPU 0 (where embed_tokens lives)
+        student_input_device = torch.device("cuda:0")
+        print(f"\n  Multi-GPU: teacher→GPU 0, student SPLIT across GPU 0+1")
     else:
-        teacher_device = student_device = torch.device("cuda")
+        student_input_device = torch.device("cuda")
 
     print(f"\n  Config:")
     print(f"    Batch:     {hw['batch_size']} x {hw['grad_accum']} accum")
@@ -762,8 +770,8 @@ def main():
     tgb = sum(p.numel() * p.element_size() for p in teacher.parameters()) / 1e9
     print(f"  Teacher: {tgb:.2f} GB")
 
-    # ── Student from GPTQ checkpoint ──
-    print("[3/5] Student (GPTQ-initialized BitLinear)...")
+    # ── Student from GPTQ checkpoint — split across both GPUs ──
+    print("[3/5] Student (GPTQ-initialized BitLinear, split across GPUs)...")
     student = AutoModelForCausalLM.from_pretrained(
         gptq_path, dtype=torch.bfloat16,
         trust_remote_code=True, attn_implementation="sdpa",
@@ -772,9 +780,30 @@ def main():
     replace_linears_from_gptq(student, gptq_scales,
                                skip_patterns=["norm", "layernorm", "rmsnorm", "embed", "lm_head"])
     student.gradient_checkpointing_enable()
-    student.to(student_device).train()
+
+    if multi_gpu:
+        # Build device map: split transformer layers across GPUs
+        # Teacher uses ~6.4 GB on GPU 0, so student gets ~73 GB on GPU 0
+        # Put first half of layers + embed on GPU 0, second half + norm + lm_head on GPU 1
+        n_layers = len(get_layers(student))
+        split = n_layers // 2  # 18 layers per GPU for 36-layer model
+        device_map = {"model.embed_tokens": 0}
+        for i in range(split):
+            device_map[f"model.layers.{i}"] = 0
+        for i in range(split, n_layers):
+            device_map[f"model.layers.{i}"] = 1
+        device_map["model.norm"] = 1
+        device_map["lm_head"] = 1
+
+        from accelerate import dispatch_model
+        student = dispatch_model(student, device_map=device_map)
+        print(f"  Student split: layers 0-{split-1} → GPU 0, layers {split}-{n_layers-1} + lm_head → GPU 1")
+    else:
+        student.to(student_input_device)
+
+    student.train()
     sgb = sum(p.numel() * p.element_size() for p in student.parameters()) / 1e9
-    print(f"  Student: {sgb:.2f} GB (GPTQ-initialized)")
+    print(f"  Student: {sgb:.2f} GB (GPTQ-initialized, split)")
 
     if torch.cuda.is_available():
         for i in range(sys_info["num_gpus"]):
@@ -854,21 +883,23 @@ def main():
 
             try:
                 # Teacher forward
+                # With split student: logits come from GPU 1 (lm_head), so send teacher there
+                loss_device = torch.device("cuda:1") if multi_gpu else student_input_device
                 with torch.no_grad():
                     t_batch = {k: v.to(teacher_device) for k, v in batch.items() if k != "labels"}
                     with torch.amp.autocast(teacher_device.type, dtype=torch.bfloat16):
                         t_out = teacher(**t_batch, output_hidden_states=True)
-                    t_logits = t_out.logits.detach().to(student_device)
-                    t_hidden = t_out.hidden_states[-1].detach().to(student_device)
+                    t_logits = t_out.logits.detach().to(loss_device)
+                    t_hidden = t_out.hidden_states[-1].detach().to(loss_device)
                     del t_out, t_batch
                     if multi_gpu:
                         torch.cuda.empty_cache()
 
-                # Student forward
-                s_batch = {k: v.to(student_device) for k, v in batch.items()}
-                labels = s_batch.pop("labels")
+                # Student forward — input goes to GPU 0 (embed_tokens), output comes from GPU 1
+                s_batch = {k: v.to(student_input_device) for k, v in batch.items()}
+                labels = s_batch.pop("labels").to(loss_device)
 
-                with torch.amp.autocast(student_device.type, dtype=torch.bfloat16):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     # Change 1: On-policy rollout — student generates from its own distribution
                     if use_on_policy:
                         gen_ids, gen_mask = generate_on_policy_sequences(
@@ -882,7 +913,7 @@ def main():
                             }
                             with torch.amp.autocast(teacher_device.type, dtype=torch.bfloat16):
                                 t_gen_out = teacher(**t_gen)
-                            t_logits_op = t_gen_out.logits.detach().to(student_device)
+                            t_logits_op = t_gen_out.logits.detach().to(loss_device)
                             del t_gen_out, t_gen
                         # Student forward on its own generated sequence
                         s_out_op = student(input_ids=gen_ids, attention_mask=gen_mask)
@@ -911,7 +942,7 @@ def main():
                     loss, mse_v, cos_v, ce_v, hmse_v, ul_v = compute_loss(
                         s_logits, t_logits, labels, s_hidden, t_hidden,
                         ul_weight=args.unlikelihood_weight,
-                        input_ids=mixed_ids)
+                        input_ids=mixed_ids.to(s_logits.device))
                     del s_logits, t_logits, s_hidden, t_hidden
 
                     # Add on-policy loss if this step used it
@@ -958,9 +989,10 @@ def main():
                 if step <= 3 or step % max(1, total_steps // 40) == 0:
                     el = time.time() - t0
                     eta = (total_steps - step) / max(step / el, 1e-9)
-                    gpu_idx = student_device.index or 0
-                    peak = torch.cuda.max_memory_allocated(gpu_idx) / 1e9
-                    alloc = torch.cuda.memory_allocated(gpu_idx) / 1e9
+                    peak0 = torch.cuda.max_memory_allocated(0) / 1e9
+                    peak1 = torch.cuda.max_memory_allocated(1) / 1e9 if sys_info["num_gpus"] > 1 else 0
+                    peak = max(peak0, peak1)
+                    alloc = (torch.cuda.memory_allocated(0) + torch.cuda.memory_allocated(1 if sys_info["num_gpus"] > 1 else 0)) / 1e9
                     print(f"  {step:>5d}/{total_steps} | "
                           f"loss={log_loss/log_n:.3f} MSE={log_mse/log_n:.3f} "
                           f"cos={log_cos/log_n:.4f} CE={log_ce/log_n:.3f} "

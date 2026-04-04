@@ -10,19 +10,18 @@ cd qwen3.5-1bit
 # 2. Install deps
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 3. Run v5 (CURRENT BEST — GPTQ init + QAT + hidden state distillation)
-PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# 3. Run v5.3 (CURRENT BEST — split student + on-policy + unlikelihood + clipped STE)
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B \
-    --use-4bit-teacher \
-    --max-steps 3000 \
-    --gen-check-interval 200 \
-    --eval-interval 500 \
-    --output-dir quantize/runs/v5-qwen3-8b \
-    2>&1 | tee run_v5.log
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
+    --gen-check-interval 100 --eval-interval 500 \
+    --output-dir quantize/runs/v5.3-qwen3-8b \
+    --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
+    --unlikelihood-weight 0.1 --on-policy-fraction 0.2 --on-policy-len 64 --ste-clip 1.0 \
+    2>&1 | tee run_v5.3.log
 
-# Skip GPTQ if already calibrated:
-# python3 quantize/run_v5.py ... --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
+# First run (no GPTQ checkpoint — runs Phase 1 first, ~15 min):
+# Remove --skip-gptq and --gptq-checkpoint flags
 ```
 
 ## GPU Memory Requirements
@@ -123,12 +122,16 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 - Phase 2 loss started WORSE (8.89 vs v4.3's 8.62) — binary values gave flat gradients
 - Root cause: initializing self.weight with GPTQ ±scale values, not smooth FP16
 
-### v5.1 run in progress (2026-04-04)
+### v5.1 (OOM at step 25 — on-policy + single-GPU student = 84 GB)
+### v5.3 run in progress (2026-04-04)
+- **Student split across both GPUs** via accelerate.dispatch_model()
+  - Layers 0-17 + embed → GPU 0 (shared with teacher)
+  - Layers 18-35 + norm + lm_head → GPU 1
+  - Peak ~50-60 GB/GPU instead of 84 GB on one
 - Fixed GPTQ init: keep FP16 magnitudes, flip signs to match GPTQ-optimal
-- Added clipped STE (PV-Tuning, 2405.14852): zero grad for |w| > 1.0
-- Added unlikelihood loss (1908.04319, weight=0.1): penalize repeated tokens
-- Added on-policy distillation (MiniLLM, 2306.08543): 20% steps, 64-token rollouts
-- Research: MiniLLM shows reverse KL on student-generated sequences fixes generation collapse
+- Clipped STE (PV-Tuning, 2405.14852): zero grad for |w| > 1.0
+- Unlikelihood loss (1908.04319, weight=0.1): penalize repeated tokens
+- On-policy distillation (MiniLLM, 2306.08543): 20% steps, 64-token rollouts — now fits!
 - Known bottleneck: 400x insufficient data (OneBit used 13.5B tokens, we use ~18M)
 
 ### Architecture notes for Qwen3/Qwen3.5

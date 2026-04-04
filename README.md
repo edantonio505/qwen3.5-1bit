@@ -14,22 +14,23 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 # Install dependencies
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 8B model — CURRENT BEST (v5: GPTQ init + QAT, requires 2x 80GB or 1x 160GB GPU)
-PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# 8B model — CURRENT BEST (v5.3: split student + on-policy + unlikelihood + clipped STE)
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B \
-    --use-4bit-teacher \
-    --max-steps 3000 \
-    --gen-check-interval 200 \
-    --eval-interval 500 \
-    --output-dir quantize/runs/v5-qwen3-8b \
-    2>&1 | tee run_v5.log
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
+    --gen-check-interval 100 --eval-interval 500 \
+    --output-dir quantize/runs/v5.3-qwen3-8b \
+    --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
+    --unlikelihood-weight 0.1 --on-policy-fraction 0.2 --on-policy-len 64 --ste-clip 1.0 \
+    2>&1 | tee run_v5.3.log
 
-# Skip GPTQ if already calibrated:
-# python3 quantize/run_v5.py ... --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
+# First run (no GPTQ checkpoint yet — runs Phase 1 first, ~15 min):
+# Remove --skip-gptq and --gptq-checkpoint flags
 
-# Previous approach (v4.3 — loss converges but generation collapses):
-# python3 quantize/run_v4.py --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000
+# Previous approaches (all failed — see Findings):
+# v4.3: python3 quantize/run_v4.py (loss converges, gen collapses)
+# v5.0: GPTQ binary init (flat gradient landscape)
+# v5.1: on-policy OOM'd (student on single GPU)
 ```
 
 ## Quick Start — Running Bonsai (PrismML's pre-built 1-bit models)
@@ -94,8 +95,8 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 | Model | Config | Total VRAM | Example GPU | Verified |
 |---|---|---|---|---|
 | Qwen3.5-2B | BF16 teacher + ProgressiveQuantized student | ~40 GB | A40 48GB | Yes |
-| Qwen3-8B | 4-bit teacher (GPU 0) + BitLinear student (GPU 1) | ~78 GB peak/GPU | 2x A100 80GB | Yes (v4.3) |
-| Qwen3-8B | 4-bit teacher + BitLinear student (single GPU) | ~85 GB peak | 1x H100 96GB / 1x A100 160GB | Estimated |
+| Qwen3-8B | 4-bit teacher + split student (v5.3) | ~50-60 GB peak/GPU | 2x A100 80GB | Yes (v5.3) |
+| Qwen3-8B | 4-bit teacher + student single GPU + on-policy | ~84 GB peak | OOM on 80GB | Yes (v5.1 OOM) |
 | Qwen3.5-35B | 4-bit teacher + student | ~380 GB | 8x A100 80GB | Estimated |
 
 **A single 80GB GPU (A100) will OOM on 8B.** Peak memory during backward hits ~78 GB for student alone; teacher needs another ~6 GB.
@@ -174,9 +175,16 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 - **Root cause:** Initializing `self.weight` with GPTQ binary values (±scale) instead of
   keeping FP16 magnitudes. Fixed in v5.1.
 
-### v5.1 Run (In Progress — 2026-04-04)
-- **Phase 1:** Reuses v5.0 GPTQ checkpoint (already calibrated)
-- **Phase 2:** Six research-backed improvements:
+### v5.1 (OOM'd at step 25)
+- On-policy distillation required 2 forward passes, pushing single-GPU student to 84 GB → OOM
+- Fix: split student across both GPUs (v5.3)
+
+### v5.3 Run (In Progress — 2026-04-04)
+- **Key change:** Student split across both GPUs via `accelerate.dispatch_model()`
+  - Layers 0-17 + embed on GPU 0 (shared with teacher)
+  - Layers 18-35 + norm + lm_head on GPU 1
+  - Peak ~50-60 GB per GPU instead of 84 GB on one
+- **All improvements active:**
   1. **Fixed GPTQ init:** FP16 magnitudes preserved, only signs flipped to GPTQ-optimal
   2. **Clipped STE** (PV-Tuning, 2405.14852): zeros grad for |w| > 1.0
   3. **Unlikelihood loss** (1908.04319, weight=0.1): penalizes repeated tokens
@@ -186,7 +194,7 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 
 ### Known bottleneck: data volume
 OneBit (NeurIPS 2024) used 13.5B tokens. We use ~18M tokens (400x less). Every working
-1-bit method used orders of magnitude more data. If v5.1 fails, scaling data is the next pivot.
+1-bit method used orders of magnitude more data. If v5.3 fails, scaling data is the next pivot.
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.
