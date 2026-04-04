@@ -20,7 +20,10 @@ PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3.5-2B
 # Quick validation (300 steps, ~2 hours)
 PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3.5-2B --max-steps 300
 
-# 8B model (needs A100 80GB+)
+# 8B model — one command on A100 80GB (recommended)
+git clone https://github.com/edantonio505/qwen3.5-1bit.git && cd qwen3.5-1bit && bash setup_and_run_8b.sh
+
+# Or manually:
 PYTHONUNBUFFERED=1 python quantize/run_v4.py --model Qwen/Qwen3-8B --use-4bit-teacher
 
 # Legacy approaches (for reference)
