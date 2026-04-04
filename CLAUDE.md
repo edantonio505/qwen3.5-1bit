@@ -262,3 +262,36 @@ quantize/
 | Qwen3.5-35B | 4-bit teacher + student | ~380 GB | 8x A100 80GB |
 
 **A single 80GB GPU (A100) will OOM on 8B.** Use 2x A100 80GB (teacher/student split) or 1x 160GB+.
+
+### Operating Guide (for Claude Code sessions)
+
+**Goal:** Quantize Qwen3-8B to true 1-bit ({-1,+1}). Target: PrismML Bonsai's 70.5% avg benchmark.
+True binary only — NEVER ternary {-1,0,+1}.
+
+**When resuming on a new server:**
+1. Check GPU setup: `nvidia-smi` — need 2x 80GB+ GPUs
+2. Check deps: `python3 -c "import torch, transformers, bitsandbytes; print('OK')"`
+3. Check if GPTQ checkpoint exists: `ls quantize/runs/v5-qwen3-8b/gptq_checkpoint/group_scales.pt`
+4. If yes: launch with `--skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint`
+5. If no: launch without those flags (runs ~15 min GPTQ Phase 1 first)
+6. Monitor: `tail -f run_v5.1.log`
+
+**Go/no-go decision points:**
+- Step 75: loss should be < 5.0 and declining
+- Step 100: gen check should show English words (not single-token repeat)
+- Step 200: gen should show partial answers or meaningful fragments
+- Step 500: eval should score ≥ 1/8 (any correct answer = breakthrough)
+- If kill signal: stop run, check fallback plan in memory/project_runbook.md
+
+**What has already failed (don't repeat):**
+- v4.3: naive sign(w) init → loss converges to 1.9, gen collapses (killed step 300)
+- v5.0: GPTQ binary values as weights → flat gradients, worse than v4.3 (killed step 3)
+- ProgressiveQuantizedLinear on 8B → OOM. Use BitLinear only.
+- KL divergence → explodes to 3600+. Use normalized MSE + cosine instead.
+- 35k examples is 400x too little data. Scale data if current approach fails.
+
+**Fallback plan (if v5.1 fails):**
+1. Scale data 100x (synthetic from teacher, OneBit-style)
+2. OneBit SVID decomposition: W = sign(W) * outer(a, b)
+3. Tanh progressive schedule (BinaryLLM, arXiv 2508.06974)
+4. Curriculum bit-width: 4-bit → 2-bit → 1-bit
