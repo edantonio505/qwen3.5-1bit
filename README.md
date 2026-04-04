@@ -55,20 +55,21 @@ w_i = scale * (2 * bit_i - 1)    bit_i in {0, 1}
 
 Effective: 1.125 bits/weight. A Qwen3-8B model compresses from 16.4 GB to ~1.15 GB.
 
-### Training Approach (v5 — GPTQ Init + QAT)
+### Training Approach (v5.1 — GPTQ Init + On-Policy + Unlikelihood + Clipped STE)
 
-| Component | Technique |
-|---|---|
-| **Phase 1: GPTQ init** | Hessian-based layer-wise calibration with Hadamard rotation + sign-flip refinement. Produces optimal binary weights as starting point for QAT. Based on "What Makes Low-Bit QAT Work" (arxiv 2601.14888) which showed 15x improvement from GPTQ init. |
-| **Phase 2: QAT** | BitLinear initialized from GPTQ-calibrated weights/scales (not naive sign(w)) |
-| Scales | Learned per group of 128 (`log_scale` initialized from GPTQ-optimized scales, 10x LR) |
-| Distillation | Normalized logit MSE (0.4) + cosine (0.2) + CE (0.4) + **hidden state MSE (0.1)** |
-| Hidden state matching | Last transformer layer output matched between teacher and student (inspired by BitDistill, arxiv 2510.13998) |
-| Scheduled sampling | Mix student's own predictions into training inputs (10%→30%) |
-| Data mix | 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + custom factual pairs) |
-| Teacher | Frozen 4-bit NF4 on GPU 0 |
-| Skipped layers | Embedding + LM head kept in FP16 |
-| Optimizer | 8-bit AdamW via bitsandbytes (saves ~16 GB) |
+| Component | Paper | Technique |
+|---|---|---|
+| **Phase 1: GPTQ init** | "What Makes Low-Bit QAT Work" (2601.14888) | Hessian-based calibration + Hadamard rotation + sign-flip refinement |
+| **Phase 1: AWQ weighting** | AWQ (2306.00978) | Activation-magnitude priority for sign-flip refinement |
+| **Phase 2: GPTQ-init BitLinear** | — | FP16 magnitudes preserved, signs flipped to match GPTQ Hessian-optimal |
+| **Clipped STE** | PV-Tuning (2405.14852) | Zero gradient for weights with \|w\| > 1.0 — focuses learning on decision boundary |
+| **On-policy distillation** | MiniLLM (2306.08543) / GKD (2306.13649) | 20% of steps: student generates 64 tokens, soft CE vs teacher on student sequences |
+| **Unlikelihood loss** | Unlikelihood Training (1908.04319) | Penalize log(1-p) for tokens in last 16 positions — breaks repetition attractor |
+| **Hidden state MSE** | BitDistill (2510.13998) / TinyBERT (1909.10351) | Match last transformer layer output between teacher and student |
+| **Distillation loss** | — | Normalized logit MSE (0.4) + cosine (0.2) + CE (0.4) + hidden MSE (0.1) + UL (0.1) |
+| **Data mix** | — | 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + custom factual) |
+| **Teacher** | — | Frozen 4-bit NF4 on GPU 0 |
+| **Optimizer** | — | 8-bit AdamW, 10x LR for scale params |
 
 ### Key Files
 
@@ -166,15 +167,26 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 
 **Outcome:** Killed at step 300 — loss plateaued at 1.93, generation still incoherent English fragments. Same convergence-without-generation pattern as all prior runs. Pivoted to v5 (GPTQ init + QAT).
 
-### v5 Run (In Progress — 2026-04-04)
-- **Phase 1:** GPTQ calibration with Hadamard rotation + 5 sign-flip refinement iterations
-- **Phase 2:** QAT from GPTQ-calibrated checkpoint with hidden state distillation
-- **Key improvement:** GPTQ-optimized binary weights as initialization (not naive sign(w))
-- **Research basis:**
-  - "What Makes Low-Bit QAT Work" (2601.14888) — GPTQ init → 15x improvement
-  - FBI-LLM (2407.07093) — proves binary {-1,+1} LLMs work at 7B scale
-  - BitDistill (2510.13998) — hidden state distillation for 1-bit
-  - QuEST (2502.05003) — Hadamard normalization for stable 1-bit training
+### v5.0 GPTQ-only Run (killed early — 2026-04-04)
+- GPTQ Phase 1 completed: total error 890,626, 0/8 eval (collapsed to "hofhofhof")
+- Phase 2 started but loss was WORSE than v4.3 (8.89 vs 8.62) — GPTQ binary values
+  gave flat gradient landscape, hurting optimization
+- **Root cause:** Initializing `self.weight` with GPTQ binary values (±scale) instead of
+  keeping FP16 magnitudes. Fixed in v5.1.
+
+### v5.1 Run (In Progress — 2026-04-04)
+- **Phase 1:** Reuses v5.0 GPTQ checkpoint (already calibrated)
+- **Phase 2:** Six research-backed improvements:
+  1. **Fixed GPTQ init:** FP16 magnitudes preserved, only signs flipped to GPTQ-optimal
+  2. **Clipped STE** (PV-Tuning, 2405.14852): zeros grad for |w| > 1.0
+  3. **Unlikelihood loss** (1908.04319, weight=0.1): penalizes repeated tokens
+  4. **On-policy distillation** (MiniLLM, 2306.08543): 20% of steps, 64-token rollouts
+  5. **Hidden state MSE** (BitDistill, 2510.13998): last layer matching
+  6. **GPTQ Hadamard + sign-flip** (QuEST, AWQ): Hessian-optimal signs
+
+### Known bottleneck: data volume
+OneBit (NeurIPS 2024) used 13.5B tokens. We use ~18M tokens (400x less). Every working
+1-bit method used orders of magnitude more data. If v5.1 fails, scaling data is the next pivot.
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.
@@ -217,24 +229,32 @@ Required on aarch64 (ARM64) systems — pre-built binaries are x64 only.
 
 ## References
 
-### Core (directly used in our pipeline)
+### Core (directly implemented in our pipeline)
 - [PrismML Bonsai-8B Whitepaper](1-bit-bonsai-8b-whitepaper.pdf) — target: 70.5% avg at 1-bit
-- [What Makes Low-Bit QAT Work for Reasoning LLMs](https://arxiv.org/abs/2601.14888) — GPTQ init yields 15x improvement for QAT
-- [FBI-LLM — Scaling Up Fully Binarized LLMs](https://arxiv.org/abs/2407.07093) — true binary {-1,+1} at 7B scale via autoregressive distillation
-- [BitDistill — Fine-tuning 1.58-bit LLMs](https://arxiv.org/abs/2510.13998) — multi-head attention distillation + SubLN
-- [QuEST — Stable Training with 1-Bit Weights](https://arxiv.org/abs/2502.05003) — Hadamard normalization + MSE-optimal fitting
-- [BitNet v2 — H-BitLinear](https://arxiv.org/abs/2504.18415) — online Hadamard transform before quantization
-- [Optimal Brain Surgeon (Hassibi, 1993)](https://papers.nips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html) — foundation for GPTQ
+- [MiniLLM — On-Policy Distillation](https://arxiv.org/abs/2306.08543) (ICLR 2024) — reverse KL + student rollouts, fixes generation collapse
+- [GKD — On-Policy Distillation](https://arxiv.org/abs/2306.13649) (ICLR 2024) — tunable on-policy fraction + flexible divergence
+- [Unlikelihood Training](https://arxiv.org/abs/1908.04319) (ICLR 2020) — penalize repeated tokens during training
+- [PV-Tuning](https://arxiv.org/abs/2405.14852) — clipped STE for extreme compression, proxy weight alternative
+- [TinyBERT](https://arxiv.org/abs/1909.10351) (EMNLP 2020) — multi-layer hidden state + attention distillation
+- [EfficientQAT](https://arxiv.org/abs/2407.11062) (ACL 2025) — block-wise QAT for memory efficiency
+- [AWQ](https://arxiv.org/abs/2306.00978) (MLSys 2024) — activation-aware sign-flip priority
+- [What Makes Low-Bit QAT Work](https://arxiv.org/abs/2601.14888) — GPTQ init yields 15x improvement
+- [BitDistill](https://arxiv.org/abs/2510.13998) — hidden state + attention distillation for 1-bit
+- [QuEST](https://arxiv.org/abs/2502.05003) — Hadamard normalization + MSE-optimal fitting for 1-bit
+- [GPTQ](https://arxiv.org/abs/2210.17323) (ICLR 2023) — Hessian-based column-wise quantization
+- [Optimal Brain Surgeon (Hassibi, 1993)](https://papers.nips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html) — mathematical foundation for GPTQ
 
-### Additional
-- [BitNet b1.58 — The Era of 1-bit LLMs](https://arxiv.org/abs/2402.17764)
-- [OneBit — Towards Extremely Low-bit LLMs](https://arxiv.org/abs/2402.11295)
-- [BiLLM — Pushing the Limit of PTQ for LLMs](https://arxiv.org/abs/2402.04291)
-- [BitDistiller — Sub-4-Bit LLM Self-Distillation](https://arxiv.org/abs/2402.10631)
-- [QuIP# — Hadamard Incoherence and Lattice Codebooks](https://arxiv.org/abs/2402.04396)
-- [ARB-LLM — Alternating Refined Binarizations](https://arxiv.org/abs/2410.03129)
-- [Rethinking 1-bit Optimization from Pre-trained LLMs](https://arxiv.org/abs/2508.06974) — curriculum FP→binary
+### Additional references
+- [FBI-LLM](https://arxiv.org/abs/2407.07093) — first proof binary {-1,+1} LLMs work at 7B
+- [OneBit — SVID decomposition](https://arxiv.org/abs/2402.11295) (NeurIPS 2024) — W = sign(W) * outer(a,b), 13.5B token training
+- [BitNet b1.58](https://arxiv.org/abs/2402.17764) — ternary {-1,0,+1} training from scratch
+- [BitNet v2 — H-BitLinear](https://arxiv.org/abs/2504.18415) — online Hadamard before activation quantization
+- [QuIP# — Hadamard Incoherence](https://arxiv.org/abs/2402.04396) — randomized Hadamard for incoherence processing
+- [Rethinking 1-bit Optimization](https://arxiv.org/abs/2508.06974) — tanh progressive schedule FP→binary
+- [ARB-LLM](https://arxiv.org/abs/2410.03129) — alternating refined binarizations
 - [Binary Neural Networks for LLMs: A Survey](https://arxiv.org/abs/2502.19008)
+- [BiLLM](https://arxiv.org/abs/2402.04291) — PTQ for LLMs
+- [BitDistiller](https://arxiv.org/abs/2402.10631) — sub-4-bit self-distillation
 
 ## License
 

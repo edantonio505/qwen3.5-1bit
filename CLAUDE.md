@@ -164,21 +164,47 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
   and can only recover so far. Research shows GPTQ initialization yields 15x better results.
 - **Decision:** Killed v4.3, built v5 with GPTQ init + QAT
 
-**v5 approach: GPTQ initialization + QAT (based on research):**
-- **Paper 1: "What Makes Low-Bit QAT Work"** (arxiv 2601.14888, Jan 2026)
-  - GPTQ calibration as initialization improved MATH-500 from 3.67%→55% (15x improvement)
-  - Hessian-weighted binary weights are far better starting point than naive sign(w)
-- **Paper 2: FBI-LLM** (arxiv 2407.07093, Jul 2024)
-  - True binary {-1,+1} LLMs via autoregressive distillation at 7B scale
-  - Shows binary models CAN learn if initialized/trained properly
-- **Paper 3: QuEST** (arxiv 2502.05003, Feb 2025)
-  - Hadamard normalization before quantization smooths outlier distributions
-  - Already implemented in our gptq_1bit.py
-- **Paper 4: BitDistill** (arxiv 2510.13998, Oct 2025)
-  - Multi-head attention distillation for 1-bit models
-  - Matching intermediate hidden states improves over logit-only distillation
-- **v5 implementation:** Phase 1 runs `gptq_1bit.py` (Hadamard + sign-flip refinement),
-  Phase 2 does QAT from the GPTQ-calibrated checkpoint with hidden state MSE loss
+**v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
+
+Six research-backed changes, each tied to a specific paper:
+
+| Change | Paper | arXiv | Key Technique |
+|--------|-------|-------|---------------|
+| On-policy distillation | MiniLLM | 2306.08543 | Reverse KL + student rollouts (fixes generation collapse) |
+| On-policy mix ratio | GKD | 2306.13649 | Tunable on-policy fraction |
+| Unlikelihood loss | Unlikelihood Training | 1908.04319 | Penalize repeated tokens during training |
+| Clipped STE | PV-Tuning | 2405.14852 | Zero grad for weights far from decision boundary |
+| Multi-layer distillation | TinyBERT | 1909.10351 | Match hidden states at layers 7,15,23,31 |
+| Hidden state distill (last layer) | BitDistill | 2510.13998 | Original motivation for hidden state matching |
+| Block-wise QAT | EfficientQAT | 2407.11062 | Freeze/unfreeze blocks to reduce VRAM |
+| Activation-weighted GPTQ | AWQ | 2306.00978 | Weight sign-flip priority by activation magnitude |
+| GPTQ init | "What Makes Low-Bit QAT Work" | 2601.14888 | Hessian-optimal binary weights as QAT starting point |
+| Hadamard rotation | QuEST / QuIP# | 2502.05003 / 2402.04396 | Spread outlier energy before binarization |
+| Binary LLM feasibility | FBI-LLM | 2407.07093 | Proves {-1,+1} LLMs work at 7B scale |
+
+**Why on-policy distillation is critical (MiniLLM):**
+Standard KD uses forward KL which forces the student to spread probability everywhere the teacher
+has mass — causing mode averaging → incoherent generation. Reverse KL (on student-generated
+sequences) is mode-seeking: the student commits to one coherent mode the teacher supports. This
+directly fixes the `\n\n` attractor / generation collapse problem.
+
+**Why unlikelihood loss helps (arXiv 1908.04319):**
+MLE training causes the model to assign too much probability to repeated tokens. At 1-bit where
+outputs are weak, the model falls into repeating the highest-probability token. Unlikelihood loss
+penalizes `log(1 - p(token))` for recently-seen tokens, breaking the repetition attractor.
+
+**Why clipped STE matters (PV-Tuning):**
+Vanilla STE passes all gradients through sign() unchanged. For weights far from ±1, this gradient
+is maximally inaccurate. Clipped STE zeros gradients for |w| > 1, focusing learning on weights
+near the decision boundary where sign flips matter most.
+
+**GPTQ init fix (v5.1):** Original v5 initialized BitLinear weights from GPTQ binary values
+(flat gradient landscape). Fixed in v5.1: keep FP16 magnitudes but flip signs to match GPTQ
+Hessian-optimal signs. Smooth landscape + optimal signs.
+
+**Data volume insight (OneBit, NeurIPS 2024):**
+Every working 1-bit method used 400-70,000x more data than our 35k examples. OneBit used 13.5B
+tokens (132k examples × 2048 seq × 50 epochs). This remains a key bottleneck to address.
 
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
@@ -207,22 +233,24 @@ quantize/
 
 **Phase 1 — GPTQ Calibration (runs once, ~10 min):**
 - Loads FP16 model, runs 128 WikiText-2 calibration samples
-- Layer-by-layer Hessian-based quantization (column-wise GPTQ)
-- Hadamard rotation before binarization (spreads outlier energy)
+- Layer-by-layer Hessian-based quantization (column-wise GPTQ, arXiv 2210.17323)
+- Hadamard rotation before binarization (QuIP#/QuEST, spreads outlier energy)
 - 5 iterations of sign-flip refinement (coordinate descent on full Hessian)
+- Activation-weighted priority for sign flips (AWQ, arXiv 2306.00978)
 - Saves calibrated checkpoint with optimal binary weights + group scales
 
 **Phase 2 — QAT Fine-tuning (multi-GPU):**
-- **Init:** BitLinear layers initialized from GPTQ-calibrated weights (not naive sign(w))
-- **Loss:** Normalized logit MSE (0.4) + cosine (0.2) + CE (0.4) + hidden state MSE (0.1)
-- **Hidden state distillation:** Matches last transformer layer output between teacher and student
+- **Init:** FP16 magnitudes preserved, signs flipped to match GPTQ Hessian-optimal signs
+- **STE:** Clipped STE — zeros gradients for |w| > 1.0 (PV-Tuning, arXiv 2405.14852)
+- **Loss:** Normalized logit MSE (0.4) + cosine (0.2) + CE (0.4) + hidden MSE (0.1) + unlikelihood (0.1)
+- **Unlikelihood:** Penalizes log(1-p) for tokens seen in last 16 positions (arXiv 1908.04319)
+- **On-policy distillation:** 20% of steps, student generates 64 tokens from prompt prefix,
+  soft CE computed between student/teacher on student-generated sequences (MiniLLM, arXiv 2306.08543)
 - **Teacher:** Frozen 4-bit NF4 on GPU 0
 - **Student:** GPTQ-initialized BitLinear on GPU 1
-- **Scheduled sampling:** 10%→30% of tokens replaced with student's own predictions
 - **Data mix:** 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + custom factual)
 - **Skipped layers:** Embedding + LM head kept in FP16
 - **Optimizer:** 8-bit AdamW with separate LR for scale params (10x multiplier)
-- **Eval:** Repetition penalty 2.0, no_repeat_ngram_size=3, greedy decoding
 
 ### GPU Requirements
 

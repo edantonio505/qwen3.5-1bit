@@ -118,11 +118,18 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 - **Root cause:** Naive sign(w) initialization leaves model in terrible basin
 - Same pattern as every prior run: loss converges, generation collapses
 
-### v5 run in progress (2026-04-04)
-- Phase 1: GPTQ calibration with Hadamard + 5 sign-flip refinement iters
-- Phase 2: QAT from GPTQ checkpoint + hidden state MSE loss
-- **Key improvement:** GPTQ-optimized binary weights → far better starting point
-- Research basis: "What Makes Low-Bit QAT Work" (2601.14888) showed GPTQ init = 15x improvement
+### v5.0 (killed — GPTQ binary init hurt optimization)
+- GPTQ Phase 1 OK (890k error, 0/8 eval — expected for 1-bit PTQ)
+- Phase 2 loss started WORSE (8.89 vs v4.3's 8.62) — binary values gave flat gradients
+- Root cause: initializing self.weight with GPTQ ±scale values, not smooth FP16
+
+### v5.1 run in progress (2026-04-04)
+- Fixed GPTQ init: keep FP16 magnitudes, flip signs to match GPTQ-optimal
+- Added clipped STE (PV-Tuning, 2405.14852): zero grad for |w| > 1.0
+- Added unlikelihood loss (1908.04319, weight=0.1): penalize repeated tokens
+- Added on-policy distillation (MiniLLM, 2306.08543): 20% steps, 64-token rollouts
+- Research: MiniLLM shows reverse KL on student-generated sequences fixes generation collapse
+- Known bottleneck: 400x insufficient data (OneBit used 13.5B tokens, we use ~18M)
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically

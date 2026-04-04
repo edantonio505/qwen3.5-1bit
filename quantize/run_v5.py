@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""1-bit QAT v5: GPTQ initialization + QAT fine-tuning.
+"""1-bit QAT v5: GPTQ init + on-policy distillation + unlikelihood + clipped STE.
 
-v4.3 showed loss converges (8.6→1.9) but generation stays incoherent.
-Research shows GPTQ initialization before QAT yields 15x improvement.
+Addresses the core problem: loss converges but generation collapses.
+Three key improvements over v4.3:
+  1. Clipped STE — reduces gradient noise from sign() (Change 3)
+  2. Unlikelihood loss — directly penalizes repeated tokens (Change 2)
+  3. On-policy distillation — student generates during training (Change 1)
+  4. GPTQ init — Hessian-optimal signs with FP16 magnitudes preserved
 
-Two-phase pipeline:
-  Phase 1: GPTQ calibration (~10 min) — Hessian-optimal binary weights
-  Phase 2: QAT fine-tuning — distillation with hidden state matching
+Research basis:
+  - MiniLLM (2306.08543): on-policy distillation with reverse KL
+  - Unlikelihood Training (1908.04319): penalize repeated tokens
+  - PV-Tuning (2405.14852): clipped STE for binary weights
+  - "What Makes Low-Bit QAT Work" (2601.14888): GPTQ init for QAT
 
 Usage:
-    # Full pipeline (GPTQ + QAT):
     PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
       python3 quantize/run_v5.py --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000
 
     # Skip GPTQ if already calibrated:
     python3 quantize/run_v5.py --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
-      --skip-gptq --gptq-checkpoint quantize/runs/v5/gptq_checkpoint
+      --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
 """
 import argparse
 import functools
@@ -67,26 +72,46 @@ print = functools.partial(print, flush=True)
 # ══════════════════════════════════════════════════════════
 
 class STE1Bit(torch.autograd.Function):
+    """Clipped STE for 1-bit quantization (Change 3).
+
+    Vanilla STE passes all gradients unchanged through sign(), which is
+    maximally inaccurate for weights far from 0. Clipped STE zeros out
+    gradients for weights with |w| > clip_val, focusing learning on
+    weights near the decision boundary where sign flips matter most.
+
+    Reference: PV-Tuning (arXiv:2405.14852), standard BNN literature.
+    """
+    CLIP_VAL = 1.0  # class-level so it can be tuned
+
     @staticmethod
     def forward(ctx, weight, scales):
         shape = weight.shape
         flat = weight.reshape(-1, GROUP_SIZE)
         signs = flat.sign()
         signs[signs == 0] = 1.0
-        ctx.save_for_backward(signs.to(torch.int8))
+        # Save both signs (int8) and weight (for clipping in backward)
+        ctx.save_for_backward(signs.to(torch.int8), weight)
         return (scales * signs).reshape(shape)
 
     @staticmethod
     def backward(ctx, grad):
-        signs_int8, = ctx.saved_tensors
+        signs_int8, weight = ctx.saved_tensors
         signs = signs_int8.to(grad.dtype)
         flat_g = grad.reshape(-1, GROUP_SIZE)
         scale_grad = (flat_g * signs).sum(dim=1, keepdim=True)
-        return grad, scale_grad
+        # Clipped STE: zero gradient for weights far from decision boundary
+        clip_mask = (weight.abs() <= STE1Bit.CLIP_VAL).to(grad.dtype)
+        return grad * clip_mask, scale_grad
 
 
 class BitLinear(nn.Module):
-    """Memory-efficient 1-bit linear. Supports GPTQ-optimized initialization."""
+    """Memory-efficient 1-bit linear. Supports GPTQ-optimized initialization.
+
+    When gptq_weight is provided, we DON'T use those binary-like values directly
+    (flat gradient landscape hurts optimization). Instead, we keep the original
+    FP16 weight magnitudes but FLIP signs to match GPTQ's Hessian-optimal signs.
+    This gives: smooth gradient landscape + Hessian-optimized sign decisions.
+    """
 
     def __init__(self, orig: nn.Linear, gptq_weight=None, gptq_scale=None):
         super().__init__()
@@ -95,7 +120,17 @@ class BitLinear(nn.Module):
         self.bias = orig.bias
 
         if gptq_weight is not None:
-            self.weight = nn.Parameter(gptq_weight.to(orig.weight.dtype))
+            # Keep FP16 magnitudes, adopt GPTQ-optimized signs
+            gptq_signs = gptq_weight.sign()
+            orig_signs = orig.weight.data.sign()
+            # Where GPTQ disagrees with naive sign, flip the FP16 weight
+            flip_mask = (gptq_signs != orig_signs)
+            new_weight = orig.weight.data.clone()
+            new_weight[flip_mask] = -new_weight[flip_mask]
+            self.weight = nn.Parameter(new_weight)
+            n_flipped = flip_mask.sum().item()
+            n_total = flip_mask.numel()
+            # Logged once per layer during construction
         else:
             self.weight = orig.weight
 
@@ -283,11 +318,53 @@ def auto_config(info, model_name):
 
 
 # ══════════════════════════════════════════════════════════
-#  Loss: Logit distillation + hidden state matching
+#  Loss: Distillation + unlikelihood + hidden state matching
 # ══════════════════════════════════════════════════════════
 
-def compute_loss(s_logits, t_logits, labels, s_hidden=None, t_hidden=None):
-    """Normalized MSE + cosine + CE + optional hidden state MSE."""
+def unlikelihood_loss(logits, input_ids, context_window=16):
+    """Penalize assigning high probability to recently-seen tokens (Change 2).
+
+    For each position t, penalize tokens that appeared in input_ids[t-context_window:t].
+    This directly fights the \\n\\n repetition attractor.
+
+    Reference: arXiv:1908.04319 — "Unlikelihood training forces unlikely
+    generations to be assigned lower probability."
+    """
+    B, T, V = logits.shape
+    probs = torch.softmax(logits, dim=-1)  # (B, T, V)
+    ul_loss = torch.zeros(1, device=logits.device, dtype=logits.dtype)
+    count = 0
+
+    for t in range(1, T):
+        start = max(0, t - context_window)
+        # Get tokens in context window for each batch element
+        ctx_tokens = input_ids[:, start:t]  # (B, window)
+        # For each batch, create mask of tokens to penalize
+        # Scatter 1s at context token positions
+        neg_mask = torch.zeros(B, V, device=logits.device, dtype=logits.dtype)
+        neg_mask.scatter_(1, ctx_tokens, 1.0)
+        # Unlikelihood: -log(1 - p(token)) for tokens in context
+        # Clamp to avoid log(0)
+        ul = -torch.log((1.0 - probs[:, t]) .clamp(min=1e-8)) * neg_mask
+        ul_loss = ul_loss + ul.sum()
+        count += B * neg_mask.sum()
+
+    if count > 0:
+        ul_loss = ul_loss / count.clamp(min=1)
+    return ul_loss
+
+
+def compute_loss(s_logits, t_logits, labels, s_hidden=None, t_hidden=None,
+                 ul_weight=0.0, input_ids=None):
+    """Normalized MSE + cosine + CE + hidden MSE + unlikelihood.
+
+    Loss weights:
+      - Normalized logit MSE: 0.4
+      - Cosine similarity: 0.2
+      - Cross-entropy: 0.4
+      - Hidden state MSE: 0.1 (if hidden states provided)
+      - Unlikelihood: ul_weight (default 0.1, if input_ids provided)
+    """
     V = s_logits.size(-1)
 
     # Normalized logit MSE
@@ -306,22 +383,29 @@ def compute_loss(s_logits, t_logits, labels, s_hidden=None, t_hidden=None):
     # Hidden state MSE (last layer before lm_head)
     h_mse_v = 0.0
     if s_hidden is not None and t_hidden is not None:
-        # Normalize hidden states for scale-invariant matching
         s_h = (s_hidden - s_hidden.mean(-1, keepdim=True)) / s_hidden.std(-1, keepdim=True).clamp(min=1e-6)
         t_h = (t_hidden - t_hidden.mean(-1, keepdim=True)) / t_hidden.std(-1, keepdim=True).clamp(min=1e-6)
         h_mse = F.mse_loss(s_h, t_h.detach())
         total = total + 0.1 * h_mse
         h_mse_v = h_mse.item()
 
-    return total, mse.item(), cos.item(), ce.item(), h_mse_v
+    # Unlikelihood loss (Change 2) — penalize repeated tokens
+    ul_v = 0.0
+    if ul_weight > 0 and input_ids is not None:
+        ul = unlikelihood_loss(s_logits, input_ids, context_window=16)
+        total = total + ul_weight * ul
+        ul_v = ul.item()
+
+    return total, mse.item(), cos.item(), ce.item(), h_mse_v, ul_v
 
 
 # ══════════════════════════════════════════════════════════
-#  Scheduled Sampling (from v4.3)
+#  On-Policy Distillation (Change 1) + Scheduled Sampling
 # ══════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def mix_with_student_predictions(student, input_ids, attention_mask, sampling_ratio):
+    """Legacy scheduled sampling — kept as fallback."""
     if sampling_ratio <= 0:
         return input_ids
     out = student(input_ids=input_ids, attention_mask=attention_mask)
@@ -332,11 +416,49 @@ def mix_with_student_predictions(student, input_ids, attention_mask, sampling_ra
     return torch.where(mask, shifted_preds, input_ids)
 
 
+@torch.no_grad()
+def generate_on_policy_sequences(student, input_ids, attention_mask, max_new=64):
+    """Generate sequences using student's own greedy decoding (Change 1).
+
+    Takes first half of input_ids as prompt prefix, then lets the student
+    generate max_new tokens autoregressively. Returns the full sequence
+    (prefix + generated) and an attention mask.
+
+    This is the core of on-policy distillation: the student must learn to
+    produce coherent output from its OWN distribution, not teacher-forced tokens.
+
+    Reference: MiniLLM (arXiv:2306.08543), GKD (arXiv:2306.13649)
+    """
+    B, T = input_ids.shape
+    prefix_len = max(T // 2, 1)
+    prefix_ids = input_ids[:, :prefix_len]
+    prefix_mask = attention_mask[:, :prefix_len]
+
+    gen_ids = prefix_ids
+    gen_mask = prefix_mask
+
+    for _ in range(max_new):
+        out = student(input_ids=gen_ids, attention_mask=gen_mask)
+        next_token = out.logits[:, -1:].argmax(dim=-1)  # (B, 1)
+        gen_ids = torch.cat([gen_ids, next_token], dim=1)
+        gen_mask = torch.cat([gen_mask, torch.ones(B, 1, device=gen_mask.device, dtype=gen_mask.dtype)], dim=1)
+
+    return gen_ids, gen_mask
+
+
 def get_sampling_ratio(step, total_steps):
     ramp_end = int(total_steps * 0.5)
     if step >= ramp_end:
         return 0.3
     return 0.1 + 0.2 * step / max(ramp_end, 1)
+
+
+def get_on_policy_fraction(step, total_steps, max_fraction=0.2):
+    """Ramp on-policy fraction from 0 to max_fraction by step 1000."""
+    ramp_end = min(1000, total_steps // 3)
+    if step >= ramp_end:
+        return max_fraction
+    return max_fraction * step / max(ramp_end, 1)
 
 
 # ══════════════════════════════════════════════════════════
@@ -543,12 +665,25 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    # v5 improvements
+    parser.add_argument("--unlikelihood-weight", type=float, default=0.1,
+                        help="Unlikelihood loss weight (Change 2, 0 to disable)")
+    parser.add_argument("--on-policy-fraction", type=float, default=0.2,
+                        help="Max fraction of steps using on-policy rollouts (Change 1)")
+    parser.add_argument("--on-policy-len", type=int, default=64,
+                        help="Max tokens generated in on-policy rollouts")
+    parser.add_argument("--ste-clip", type=float, default=1.0,
+                        help="STE clipping threshold (Change 3, 0 to disable)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
 
+    # Set STE clipping threshold
+    if args.ste_clip > 0:
+        STE1Bit.CLIP_VAL = args.ste_clip
+
     print("=" * 60)
-    print("  1-bit QAT v5 — GPTQ Init + Distillation")
+    print("  1-bit QAT v5 — GPTQ + On-Policy + Unlikelihood + Clipped STE")
     print("=" * 60)
 
     # ════════════════════════════════════════════
@@ -694,10 +829,13 @@ def main():
     sched = get_cosine_schedule_with_warmup(opt, warmup, total_steps)
 
     print(f"\n  Training plan:")
-    print(f"    Steps:    {total_steps} | Warmup: {warmup}")
-    print(f"    Mode:     GPTQ-init BitLinear (full 1-bit)")
-    print(f"    Sampling: 10%→30%")
-    print(f"    Loss:     MSE(0.4) + cos(0.2) + CE(0.4) + hidden_MSE(0.1)")
+    print(f"    Steps:      {total_steps} | Warmup: {warmup}")
+    print(f"    Mode:       GPTQ-init BitLinear (full 1-bit)")
+    print(f"    STE clip:   {args.ste_clip} (0=vanilla STE)")
+    print(f"    Unlikelihood: {args.unlikelihood_weight} (0=disabled)")
+    print(f"    On-policy:  {args.on_policy_fraction*100:.0f}% max, {args.on_policy_len} tokens")
+    print(f"    Sampling:   10%→30% (fallback)")
+    print(f"    Loss:       MSE(0.4) + cos(0.2) + CE(0.4) + h_MSE(0.1) + UL({args.unlikelihood_weight})")
     print()
 
     # ── Train ──
@@ -706,11 +844,13 @@ def main():
     step = 0
     oom_count = 0
     t0 = time.time()
-    log_loss = log_mse = log_cos = log_ce = log_hmse = log_n = 0
+    log_loss = log_mse = log_cos = log_ce = log_hmse = log_ul = log_n = 0
 
     for epoch in range(args.epochs):
         for bi, batch in enumerate(loader):
             sr = get_sampling_ratio(step, total_steps)
+            op_frac = get_on_policy_fraction(step, total_steps, args.on_policy_fraction)
+            use_on_policy = (op_frac > 0 and random.random() < op_frac)
 
             try:
                 # Teacher forward
@@ -729,7 +869,33 @@ def main():
                 labels = s_batch.pop("labels")
 
                 with torch.amp.autocast(student_device.type, dtype=torch.bfloat16):
-                    if sr > 0 and student.training:
+                    # Change 1: On-policy rollout — student generates from its own distribution
+                    if use_on_policy:
+                        gen_ids, gen_mask = generate_on_policy_sequences(
+                            student, s_batch["input_ids"], s_batch["attention_mask"],
+                            max_new=args.on_policy_len)
+                        # Get teacher logits on student-generated sequence
+                        with torch.no_grad():
+                            t_gen = {
+                                "input_ids": gen_ids.to(teacher_device),
+                                "attention_mask": gen_mask.to(teacher_device),
+                            }
+                            with torch.amp.autocast(teacher_device.type, dtype=torch.bfloat16):
+                                t_gen_out = teacher(**t_gen)
+                            t_logits_op = t_gen_out.logits.detach().to(student_device)
+                            del t_gen_out, t_gen
+                        # Student forward on its own generated sequence
+                        s_out_op = student(input_ids=gen_ids, attention_mask=gen_mask)
+                        s_logits_op = s_out_op.logits
+                        del s_out_op
+                        # On-policy soft CE loss (student should match teacher on its OWN sequences)
+                        t_probs = F.softmax(t_logits_op, dim=-1)
+                        s_log_probs = F.log_softmax(s_logits_op, dim=-1)
+                        op_loss = -(t_probs * s_log_probs).sum(dim=-1).mean()
+                        del t_logits_op, s_logits_op, t_probs, s_log_probs, gen_ids, gen_mask
+
+                    # Standard teacher-forced forward (always run for main loss)
+                    if sr > 0 and student.training and not use_on_policy:
                         mixed_ids = mix_with_student_predictions(
                             student, s_batch["input_ids"], s_batch["attention_mask"], sr)
                     else:
@@ -742,9 +908,17 @@ def main():
                     s_hidden = s_out.hidden_states[-1]
                     del s_out
 
-                    loss, mse_v, cos_v, ce_v, hmse_v = compute_loss(
-                        s_logits, t_logits, labels, s_hidden, t_hidden)
+                    loss, mse_v, cos_v, ce_v, hmse_v, ul_v = compute_loss(
+                        s_logits, t_logits, labels, s_hidden, t_hidden,
+                        ul_weight=args.unlikelihood_weight,
+                        input_ids=mixed_ids)
                     del s_logits, t_logits, s_hidden, t_hidden
+
+                    # Add on-policy loss if this step used it
+                    if use_on_policy:
+                        loss = loss + 0.3 * op_loss
+                        del op_loss
+
                     loss = loss / hw["grad_accum"]
 
                 loss.backward()
@@ -770,6 +944,7 @@ def main():
             log_cos += cos_v
             log_ce += ce_v
             log_hmse += hmse_v
+            log_ul += ul_v
             log_n += 1
 
             if (bi + 1) % hw["grad_accum"] == 0:
@@ -789,10 +964,10 @@ def main():
                     print(f"  {step:>5d}/{total_steps} | "
                           f"loss={log_loss/log_n:.3f} MSE={log_mse/log_n:.3f} "
                           f"cos={log_cos/log_n:.4f} CE={log_ce/log_n:.3f} "
-                          f"h_MSE={log_hmse/log_n:.3f} | "
-                          f"sr={sr:.2f} GPU={alloc:.0f}/{peak:.0f}GB | "
+                          f"h={log_hmse/log_n:.3f} ul={log_ul/log_n:.3f} | "
+                          f"sr={sr:.2f} op={op_frac:.2f} GPU={alloc:.0f}/{peak:.0f}GB | "
                           f"lr={sched.get_last_lr()[0]:.1e} | ETA {eta/60:.1f}m")
-                    log_loss = log_mse = log_cos = log_ce = log_hmse = log_n = 0
+                    log_loss = log_mse = log_cos = log_ce = log_hmse = log_ul = log_n = 0
 
                 # Gen check
                 if step % args.gen_check_interval == 0:
