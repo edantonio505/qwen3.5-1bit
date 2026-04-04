@@ -10,19 +10,19 @@ cd qwen3.5-1bit
 # 2. Install deps
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 3. Run v4.3 (CURRENT BEST — auto-detects GPUs, uses BitLinear for 8B)
+# 3. Run v5 (CURRENT BEST — GPTQ init + QAT + hidden state distillation)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  python3 quantize/run_v4.py \
+  python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B \
     --use-4bit-teacher \
     --max-steps 3000 \
     --gen-check-interval 200 \
     --eval-interval 500 \
-    --output-dir quantize/runs/v4.3-qwen3-8b \
-    2>&1 | tee run.log
+    --output-dir quantize/runs/v5-qwen3-8b \
+    2>&1 | tee run_v5.log
 
-# Legacy (simpler, no scheduled sampling):
-PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B 2>&1 | tee run.log
+# Skip GPTQ if already calibrated:
+# python3 quantize/run_v5.py ... --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
 ```
 
 ## GPU Memory Requirements
@@ -41,19 +41,25 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 
 ## What the Script Does
 
-`run_v4.py` auto-detects:
+`run_v5.py` auto-detects:
 - Number of GPUs → multi-GPU mode (teacher GPU 0, student GPU 1) or single GPU
 - Total VRAM → sets batch size, seq length, grad accumulation
 - Model size → uses BitLinear (8B+) or ProgressiveQuantizedLinear (2B)
 
-It then:
-1. Loads teacher (4-bit via bitsandbytes NF4) on GPU 0 — frozen, provides soft targets
-2. Loads student (BF16 → BitLinear 1-bit) on GPU 1 — with gradient checkpointing
-3. Loads mixed data: 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + factual pairs)
-4. Trains with normalized logit MSE (0.4) + cosine (0.2) + CE (0.4)
-5. Uses scheduled sampling (10%→30%) to mix student predictions into training
-6. Runs generation checks every 200 steps, full eval every 500 steps
-7. Saves best checkpoint + final model to output dir
+It then runs a two-phase pipeline:
+
+**Phase 1 — GPTQ Calibration (~10 min, single GPU):**
+1. Loads FP16 model, runs 128 WikiText-2 calibration samples
+2. Quantizes each layer with Hessian-weighted GPTQ + Hadamard rotation + sign-flip refinement
+3. Saves calibrated checkpoint (optimal binary weights + group scales)
+4. Frees GPU memory for Phase 2
+
+**Phase 2 — QAT Fine-tuning (multi-GPU):**
+1. Loads teacher (4-bit NF4) on GPU 0
+2. Loads GPTQ-calibrated student on GPU 1 — BitLinear initialized from optimal binary weights
+3. Trains with logit MSE (0.4) + cosine (0.2) + CE (0.4) + **hidden state MSE (0.1)**
+4. Uses scheduled sampling (10%→30%)
+5. Saves best checkpoint + final model
 
 ### Memory-critical details
 - **BitLinear** (not ProgressiveQuantizedLinear) for 8B: saves signs as int8 (1 byte vs 2), no blending
@@ -106,15 +112,17 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 7. **Dynamic scales work** — learned scales had shape bugs with Qwen3.5 architecture
 8. **8-bit AdamW is essential for 8B** — saves ~16 GB, difference between OOM and fitting
 
-### v4.3 run in progress (2026-04-04)
-- 2x A100 80GB, Qwen3-8B, BitLinear, 4-bit teacher
-- 3000 steps, batch=1, seq=512, grad_accum=16, 8-bit AdamW
-- 35k examples (30k chat + 5k QA), scheduled sampling 10%→30%
-- Loss: 8.6→4.2→2.6→2.0 (step 225), CE: 19→3.8, still declining
-- Step 200 gen: random gibberish → English word fragments (progress!)
-- CUDA crash at step 200 fixed with try/except + synchronize
-- GPU stable at 33/78 GB, no OOM
-- Running with `CUDA_LAUNCH_BLOCKING=1` for reliability (~30% slower)
+### v4.3 results (killed at step 300)
+- Loss plateaued at 1.93 (delta only -0.12 over last 75 steps)
+- Generation: random gibberish → English word fragments, but never correct answers
+- **Root cause:** Naive sign(w) initialization leaves model in terrible basin
+- Same pattern as every prior run: loss converges, generation collapses
+
+### v5 run in progress (2026-04-04)
+- Phase 1: GPTQ calibration with Hadamard + 5 sign-flip refinement iters
+- Phase 2: QAT from GPTQ checkpoint + hidden state MSE loss
+- **Key improvement:** GPTQ-optimized binary weights → far better starting point
+- Research basis: "What Makes Low-Bit QAT Work" (2601.14888) showed GPTQ init = 15x improvement
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically
@@ -138,7 +146,9 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 
 ```
 quantize/
-├── run_v4.py         # CURRENT: v4.3 — BitLinear (8B) / Progressive (2B), scheduled sampling
+├── run_v5.py         # CURRENT: v5 — GPTQ init + QAT + hidden state distillation
+├── gptq_1bit.py      # GPTQ 1-bit PTQ: Hadamard, sign-flip refinement, layer-wise calibration
+├── run_v4.py         # v4.3 — BitLinear QAT (loss converges but gen collapses)
 ├── run_cloud.py      # Cloud training (multi-GPU, 4-bit teacher, auto-detect, BitLinear)
 ├── run.py            # Legacy: local training with SubLN + dynamic scales
 ├── quantize_lib.py   # Full library (progressive quant, Hadamard, learned scales)

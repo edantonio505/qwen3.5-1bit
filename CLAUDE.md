@@ -75,19 +75,22 @@ git clone https://github.com/edantonio505/qwen3.5-1bit.git
 cd qwen3.5-1bit
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# CURRENT best command for 8B (v4.3 with BitLinear):
+# CURRENT best command for 8B (v5: GPTQ init + QAT):
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  python3 quantize/run_v4.py \
+  python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B \
     --use-4bit-teacher \
     --max-steps 3000 \
     --gen-check-interval 200 \
     --eval-interval 500 \
-    --output-dir quantize/runs/v4.3-qwen3-8b \
-    2>&1 | tee run.log
+    --output-dir quantize/runs/v5-qwen3-8b \
+    2>&1 | tee run_v5.log
 
-# Legacy (simpler but less features):
-PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B 2>&1 | tee run.log
+# Previous (v4.3 — loss converges but generation collapses):
+# python3 quantize/run_v4.py --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000
+
+# Legacy (simpler, no scheduled sampling):
+# python3 quantize/run_cloud.py --model Qwen/Qwen3-8B
 ```
 
 If OOM, reduce batch/seq: `--batch-size 1 --seq-len 512`
@@ -153,14 +156,29 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 - `CUDA_LAUNCH_BLOCKING=1` env var makes kernels synchronous (pinpoints errors, ~30% slower)
 - After fix, training continues even if gen check fails
 
-**v4.3 training trajectory (Qwen3-8B, 2x A100 80GB):**
-- Step 1→75: loss 8.6→4.2 (warmup, LR ramping)
-- Step 75→150: loss 4.2→2.6 (warmup completing)
-- Step 150→225: loss 2.6→2.0 (post-warmup, still declining — good sign)
-- Step 200 gen check: gibberish → English word fragments ("Nowonenatorinaeseinged up down away did")
-- Generation went from random tokens to real English words in 200 steps — model IS learning
-- But still incoherent — no correct answers yet. Need to watch step 400-500 for semantic progress.
-- CE: 19→8.8→5.1→3.8 — consistent improvement, no plateau yet
+**v4.3 proved loss converges but generation doesn't (killed at step 300):**
+- Loss: 8.6→4.2→2.6→2.0→1.9 (plateauing at ~1.9)
+- CE: 19→8.8→5.1→3.8→3.6 (slowing dramatically: delta only -0.12 over last 75 steps)
+- Step 200 gen: gibberish → English word fragments, but incoherent ("Nowonenatorinaeseinged")
+- **Root cause:** Naive `sign(w)` initialization. The model starts from terrible binary weights
+  and can only recover so far. Research shows GPTQ initialization yields 15x better results.
+- **Decision:** Killed v4.3, built v5 with GPTQ init + QAT
+
+**v5 approach: GPTQ initialization + QAT (based on research):**
+- **Paper 1: "What Makes Low-Bit QAT Work"** (arxiv 2601.14888, Jan 2026)
+  - GPTQ calibration as initialization improved MATH-500 from 3.67%→55% (15x improvement)
+  - Hessian-weighted binary weights are far better starting point than naive sign(w)
+- **Paper 2: FBI-LLM** (arxiv 2407.07093, Jul 2024)
+  - True binary {-1,+1} LLMs via autoregressive distillation at 7B scale
+  - Shows binary models CAN learn if initialized/trained properly
+- **Paper 3: QuEST** (arxiv 2502.05003, Feb 2025)
+  - Hadamard normalization before quantization smooths outlier distributions
+  - Already implemented in our gptq_1bit.py
+- **Paper 4: BitDistill** (arxiv 2510.13998, Oct 2025)
+  - Multi-head attention distillation for 1-bit models
+  - Matching intermediate hidden states improves over logit-only distillation
+- **v5 implementation:** Phase 1 runs `gptq_1bit.py` (Hadamard + sign-flip refinement),
+  Phase 2 does QAT from the GPTQ-calibrated checkpoint with hidden state MSE loss
 
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
@@ -173,7 +191,9 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 
 ```
 quantize/
-├── run_v4.py          # CURRENT: v4.3 QAT with BitLinear (8B), progressive (2B), scheduled sampling
+├── run_v5.py          # CURRENT: v5 — GPTQ init + QAT with hidden state distillation
+├── run_v4.py          # v4.3 QAT with BitLinear — loss converges but gen collapses
+├── gptq_1bit.py       # GPTQ 1-bit PTQ with Hadamard rotation + sign-flip refinement
 ├── run_cloud.py       # Cloud QAT with BitLinear + 4-bit teacher, auto-detects GPUs/VRAM/arch
 ├── run.py             # Local QAT with SubLN + dynamic scales (for DIGITS)
 ├── quantize_lib.py    # Shared library: ProgressiveQuantizedLinear, Hadamard, learned scales, STE
@@ -183,13 +203,22 @@ quantize/
 └── train.py           # Standalone training script
 ```
 
-### Training Architecture (run_v4.py)
+### Training Architecture (run_v5.py)
 
-- **Loss:** Normalized logit MSE (0.4) + cosine similarity (0.2) + CE (0.4)
-- **Teacher:** Frozen copy of base model (4-bit via bitsandbytes for 8B+)
-- **Student:** Same model with BitLinear layers (1-bit weights, learned group scales)
-- **Quantizer:** BitLinear for 8B (memory-efficient, int8 signs), ProgressiveQuantizedLinear for 2B (blending schedule)
-- **Scheduled sampling:** 10%→30% of tokens replaced with student's own predictions during training
+**Phase 1 — GPTQ Calibration (runs once, ~10 min):**
+- Loads FP16 model, runs 128 WikiText-2 calibration samples
+- Layer-by-layer Hessian-based quantization (column-wise GPTQ)
+- Hadamard rotation before binarization (spreads outlier energy)
+- 5 iterations of sign-flip refinement (coordinate descent on full Hessian)
+- Saves calibrated checkpoint with optimal binary weights + group scales
+
+**Phase 2 — QAT Fine-tuning (multi-GPU):**
+- **Init:** BitLinear layers initialized from GPTQ-calibrated weights (not naive sign(w))
+- **Loss:** Normalized logit MSE (0.4) + cosine (0.2) + CE (0.4) + hidden state MSE (0.1)
+- **Hidden state distillation:** Matches last transformer layer output between teacher and student
+- **Teacher:** Frozen 4-bit NF4 on GPU 0
+- **Student:** GPTQ-initialized BitLinear on GPU 1
+- **Scheduled sampling:** 10%→30% of tokens replaced with student's own predictions
 - **Data mix:** 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + custom factual)
 - **Skipped layers:** Embedding + LM head kept in FP16
 - **Optimizer:** 8-bit AdamW with separate LR for scale params (10x multiplier)

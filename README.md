@@ -6,7 +6,7 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 
 ## Status
 
-**Active: v4.3 training run in progress on 2x A100 80GB.** Training Qwen3-8B to true 1-bit (Q1_0_g128) with BitLinear + 4-bit teacher distillation. 3000-step run with scheduled sampling and mixed QA+chat data. Previous runs proved loss converges; this run tests whether BitLinear + more data + scheduled sampling breaks through the generation collapse barrier.
+**Active: v5 training run on 2x A100 80GB.** Two-phase pipeline: (1) GPTQ calibration with Hadamard rotation for optimal binary weight initialization, (2) QAT fine-tuning with hidden state distillation. v4.3 proved loss converges but generation collapses with naive sign(w) init — research shows GPTQ initialization yields 15x better results.
 
 ## Quick Start — Training
 
@@ -14,22 +14,22 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 # Install dependencies
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 8B model — CURRENT BEST (v4.3, requires 2x 80GB or 1x 160GB GPU)
+# 8B model — CURRENT BEST (v5: GPTQ init + QAT, requires 2x 80GB or 1x 160GB GPU)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  python3 quantize/run_v4.py \
+  python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B \
     --use-4bit-teacher \
     --max-steps 3000 \
     --gen-check-interval 200 \
     --eval-interval 500 \
-    --output-dir quantize/runs/v4.3-qwen3-8b \
-    2>&1 | tee run.log
+    --output-dir quantize/runs/v5-qwen3-8b \
+    2>&1 | tee run_v5.log
 
-# 2B model — quick validation (~2 hours on 48GB GPU)
-PYTHONUNBUFFERED=1 python3 quantize/run_v4.py --model Qwen/Qwen3.5-2B --max-steps 300
+# Skip GPTQ if already calibrated:
+# python3 quantize/run_v5.py ... --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
 
-# Legacy cloud script (simpler, fewer features):
-PYTHONUNBUFFERED=1 python quantize/run_cloud.py --model Qwen/Qwen3-8B
+# Previous approach (v4.3 — loss converges but generation collapses):
+# python3 quantize/run_v4.py --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000
 ```
 
 ## Quick Start — Running Bonsai (PrismML's pre-built 1-bit models)
@@ -55,26 +55,28 @@ w_i = scale * (2 * bit_i - 1)    bit_i in {0, 1}
 
 Effective: 1.125 bits/weight. A Qwen3-8B model compresses from 16.4 GB to ~1.15 GB.
 
-### Training Approach (v4.3)
+### Training Approach (v5 — GPTQ Init + QAT)
 
 | Component | Technique |
 |---|---|
-| Quantization (8B) | `BitLinear` — STE with int8 sign storage (50% less memory), pure 1-bit from start |
-| Quantization (2B) | `ProgressiveQuantizedLinear` — blends FP and 1-bit via noise schedule (0.5→1.0) |
-| Scales | Learned per group of 128 (`log_scale` parameters, 10x LR multiplier) |
-| Distillation | Normalized logit MSE (0.4) + cosine similarity (0.2) + CE (0.4). NOT KL — it explodes at 1-bit |
-| Scheduled sampling | Mix student's own predictions into training inputs (10%→30%) to fix exposure bias |
+| **Phase 1: GPTQ init** | Hessian-based layer-wise calibration with Hadamard rotation + sign-flip refinement. Produces optimal binary weights as starting point for QAT. Based on "What Makes Low-Bit QAT Work" (arxiv 2601.14888) which showed 15x improvement from GPTQ init. |
+| **Phase 2: QAT** | BitLinear initialized from GPTQ-calibrated weights/scales (not naive sign(w)) |
+| Scales | Learned per group of 128 (`log_scale` initialized from GPTQ-optimized scales, 10x LR) |
+| Distillation | Normalized logit MSE (0.4) + cosine (0.2) + CE (0.4) + **hidden state MSE (0.1)** |
+| Hidden state matching | Last transformer layer output matched between teacher and student (inspired by BitDistill, arxiv 2510.13998) |
+| Scheduled sampling | Mix student's own predictions into training inputs (10%→30%) |
 | Data mix | 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + custom factual pairs) |
-| Teacher | Frozen 4-bit via bitsandbytes NF4 (8B), or BF16 (2B). Separate GPU for 8B |
-| Skipped layers | Embedding + LM head kept in FP16 (critical for generation) |
+| Teacher | Frozen 4-bit NF4 on GPU 0 |
+| Skipped layers | Embedding + LM head kept in FP16 |
 | Optimizer | 8-bit AdamW via bitsandbytes (saves ~16 GB) |
-| Eval | Repetition penalty 2.0, no_repeat_ngram_size=3, greedy + sampling fallback |
 
 ### Key Files
 
 ```
 quantize/
-├── run_v4.py         # CURRENT: v4.3 QAT — BitLinear (8B) / Progressive (2B), scheduled sampling
+├── run_v5.py         # CURRENT: v5 — GPTQ init + QAT + hidden state distillation
+├── gptq_1bit.py      # GPTQ 1-bit PTQ: Hadamard rotation, sign-flip refinement, layer-wise calibration
+├── run_v4.py         # v4.3: BitLinear QAT (loss converges but generation collapses)
 ├── run_cloud.py      # Cloud training (multi-GPU, 4-bit teacher, auto-detect, BitLinear)
 ├── run.py            # Legacy: local training with SubLN + dynamic scales
 ├── quantize_lib.py   # Core: ProgressiveQuantizedLinear, STE, Hadamard, learned scales
@@ -162,12 +164,17 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 | 200 | — | — | `Nowonenatorinaeseinged up down away did` (English fragments!) |
 | 225 | 2.05 | 3.8 | — |
 
-**Key observations:**
-- Loss still declining at step 225 (no plateau yet) — strong go signal
-- Generation evolved from random gibberish to English word fragments in 200 steps
-- CUDA illegal memory access at step 200 gen check (async error) — fixed with try/except + synchronize
-- GPU stable at 33/78 GB throughout, no OOM
-- `CUDA_LAUNCH_BLOCKING=1` needed for reliable gen checks (~30% slower but no crashes)
+**Outcome:** Killed at step 300 — loss plateaued at 1.93, generation still incoherent English fragments. Same convergence-without-generation pattern as all prior runs. Pivoted to v5 (GPTQ init + QAT).
+
+### v5 Run (In Progress — 2026-04-04)
+- **Phase 1:** GPTQ calibration with Hadamard rotation + 5 sign-flip refinement iterations
+- **Phase 2:** QAT from GPTQ-calibrated checkpoint with hidden state distillation
+- **Key improvement:** GPTQ-optimized binary weights as initialization (not naive sign(w))
+- **Research basis:**
+  - "What Makes Low-Bit QAT Work" (2601.14888) — GPTQ init → 15x improvement
+  - FBI-LLM (2407.07093) — proves binary {-1,+1} LLMs work at 7B scale
+  - BitDistill (2510.13998) — hidden state distillation for 1-bit
+  - QuEST (2502.05003) — Hadamard normalization for stable 1-bit training
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.
@@ -210,13 +217,24 @@ Required on aarch64 (ARM64) systems — pre-built binaries are x64 only.
 
 ## References
 
-- [PrismML Bonsai-8B Whitepaper](1-bit-bonsai-8b-whitepaper.pdf)
+### Core (directly used in our pipeline)
+- [PrismML Bonsai-8B Whitepaper](1-bit-bonsai-8b-whitepaper.pdf) — target: 70.5% avg at 1-bit
+- [What Makes Low-Bit QAT Work for Reasoning LLMs](https://arxiv.org/abs/2601.14888) — GPTQ init yields 15x improvement for QAT
+- [FBI-LLM — Scaling Up Fully Binarized LLMs](https://arxiv.org/abs/2407.07093) — true binary {-1,+1} at 7B scale via autoregressive distillation
+- [BitDistill — Fine-tuning 1.58-bit LLMs](https://arxiv.org/abs/2510.13998) — multi-head attention distillation + SubLN
+- [QuEST — Stable Training with 1-Bit Weights](https://arxiv.org/abs/2502.05003) — Hadamard normalization + MSE-optimal fitting
+- [BitNet v2 — H-BitLinear](https://arxiv.org/abs/2504.18415) — online Hadamard transform before quantization
+- [Optimal Brain Surgeon (Hassibi, 1993)](https://papers.nips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html) — foundation for GPTQ
+
+### Additional
 - [BitNet b1.58 — The Era of 1-bit LLMs](https://arxiv.org/abs/2402.17764)
 - [OneBit — Towards Extremely Low-bit LLMs](https://arxiv.org/abs/2402.11295)
 - [BiLLM — Pushing the Limit of PTQ for LLMs](https://arxiv.org/abs/2402.04291)
 - [BitDistiller — Sub-4-Bit LLM Self-Distillation](https://arxiv.org/abs/2402.10631)
 - [QuIP# — Hadamard Incoherence and Lattice Codebooks](https://arxiv.org/abs/2402.04396)
-- [Optimal Brain Surgeon (Hassibi, 1993)](https://papers.nips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html)
+- [ARB-LLM — Alternating Refined Binarizations](https://arxiv.org/abs/2410.03129)
+- [Rethinking 1-bit Optimization from Pre-trained LLMs](https://arxiv.org/abs/2508.06974) — curriculum FP→binary
+- [Binary Neural Networks for LLMs: A Survey](https://arxiv.org/abs/2502.19008)
 
 ## License
 
