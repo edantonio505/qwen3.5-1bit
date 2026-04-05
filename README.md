@@ -232,6 +232,13 @@ Implements ALL 5 fixes found by auditing OneBit's actual codebase (github.com/xu
 | **4. All-layer directional alignment** | L2-normalized MSE at every layer, pkd_loss dominant | Forces all 36 layers to track teacher's hidden state directions. KD logit loss scaled down 100x. |
 | **5. LR 1e-4, beta2=0.98** | 20x higher LR, responsive optimizer | OneBit uses 4e-4. Our 5e-6 was 80x too low — sign landscape was frozen. |
 
+**Early results (step 250):**
+- pkd_loss (all-layer alignment): **65.6 → 34.8** (47% reduction). All 36 layers aligning with teacher.
+- KD loss: **4296 → 2220** (halved). Student logits approaching teacher distribution.
+- Gen at step 200: function words (`, the to a and 0 in for`). Still in warmup (LR 5e-5/1e-4).
+- GPU stable at 39/52 GB per GPU. ETA ~57 hours for 10k steps.
+- **Qualitatively different from prior runs:** pkd_loss directly measures internal representation quality, not just output logit matching. 47% drop means LayerNorm is keeping activations bounded.
+
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.
 

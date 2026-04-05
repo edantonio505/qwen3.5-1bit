@@ -210,7 +210,7 @@ v7 (killed — missing OneBit's core architecture):
 - Simple loss + SVID worked for training, but still 0/8 gen because we were missing
   the critical architectural feature: LayerNorm inside every BitLinear.
 
-v8 (running) — Full OneBit architecture from their actual codebase:
+v8 (running, step 250) — Full OneBit architecture from their actual codebase:
 - **FIX 1 (PRIMARY BUG):** LayerNorm(elementwise_affine=False) inside every SVIDBitLinear
   → Prevents activation magnitude explosion during autoregressive generation
   → Without this, each 1-bit layer amplifies errors by O(√d), model diverges by layer 20
@@ -220,6 +220,9 @@ v8 (running) — Full OneBit architecture from their actual codebase:
 - **FIX 4:** All-layer normalized directional alignment (L2-norm MSE at every layer, dominant term)
   → pkd_loss is the main signal, KD logit loss scaled down 100x
 - **FIX 5:** LR 1e-4 (was 5e-6, 20x increase), adam_beta2=0.98 (more responsive to sign flips)
+- **Early results (step 250):** pkd_loss dropped 65.6→34.8 (47% reduction in all-layer directional error)
+  KD loss halved 4296→2220. Still in warmup (LR at 5e-5, target 1e-4).
+  Gen at step 200: function words (`, the to a and 0 in for`). Waiting for step 400+ gen check.
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 

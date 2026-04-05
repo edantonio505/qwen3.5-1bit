@@ -153,6 +153,8 @@ Research agent audited OneBit's GitHub codebase, found 5 critical missing featur
 - **FIX 4:** All-layer L2-normalized directional alignment (dominant loss term)
 - **FIX 5:** LR 1e-4 (was 5e-6), beta2=0.98
 - 30k examples × 50 epochs, SVID, simple loss, 10k steps
+- **Step 250 results:** pkd_loss 65.6→34.8 (47% drop), KD loss 4296→2220 (halved)
+- Gen step 200: function words. Waiting for step 400+ to see if LayerNorm breaks the pattern.
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically
