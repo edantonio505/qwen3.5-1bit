@@ -273,28 +273,28 @@ Required on aarch64 (ARM64) systems — pre-built binaries are x64 only.
 
 ## References
 
-### Core (directly implemented in our pipeline)
-- [PrismML Bonsai-8B Whitepaper](1-bit-bonsai-8b-whitepaper.pdf) — target: 70.5% avg at 1-bit
-- [MiniLLM — On-Policy Distillation](https://arxiv.org/abs/2306.08543) (ICLR 2024) — reverse KL + student rollouts, fixes generation collapse
-- [GKD — On-Policy Distillation](https://arxiv.org/abs/2306.13649) (ICLR 2024) — tunable on-policy fraction + flexible divergence
-- [Unlikelihood Training](https://arxiv.org/abs/1908.04319) (ICLR 2020) — penalize repeated tokens during training
-- [PV-Tuning](https://arxiv.org/abs/2405.14852) — clipped STE for extreme compression, proxy weight alternative
-- [TinyBERT](https://arxiv.org/abs/1909.10351) (EMNLP 2020) — multi-layer hidden state + attention distillation
-- [EfficientQAT](https://arxiv.org/abs/2407.11062) (ACL 2025) — block-wise QAT for memory efficiency
-- [AWQ](https://arxiv.org/abs/2306.00978) (MLSys 2024) — activation-aware sign-flip priority
-- [What Makes Low-Bit QAT Work](https://arxiv.org/abs/2601.14888) — GPTQ init yields 15x improvement
-- [BitDistill](https://arxiv.org/abs/2510.13998) — hidden state + attention distillation for 1-bit
-- [QuEST](https://arxiv.org/abs/2502.05003) — Hadamard normalization + MSE-optimal fitting for 1-bit
-- [GPTQ](https://arxiv.org/abs/2210.17323) (ICLR 2023) — Hessian-based column-wise quantization
-- [Optimal Brain Surgeon (Hassibi, 1993)](https://papers.nips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html) — mathematical foundation for GPTQ
+### Core (directly implemented in v8 pipeline)
+- **[OneBit](https://arxiv.org/abs/2402.11295) (NeurIPS 2024)** — **PRIMARY SOURCE.** Our entire v8 architecture: SVID decomposition, LayerNorm inside BitLinear, tanh-STE, NMF init, per-layer directional alignment loss. [GitHub](https://github.com/xuyuzhuang11/OneBit)
+- **[FBI-LLM](https://arxiv.org/abs/2407.07093)** — Proved binary {-1,+1} LLMs work at 7B. Showed distillation-only loss outperforms combined losses.
+- [PrismML Bonsai-8B Whitepaper](1-bit-bonsai-8b-whitepaper.pdf) — target: 70.5% avg at 1-bit (proprietary)
+- [MiniLLM](https://arxiv.org/abs/2306.08543) (ICLR 2024) — on-policy distillation with reverse KL
+- [GPTQ](https://arxiv.org/abs/2210.17323) (ICLR 2023) — Hessian-based calibration for Phase 1 init
+- [What Makes Low-Bit QAT Work](https://arxiv.org/abs/2601.14888) — GPTQ init before QAT
+- [QuEST](https://arxiv.org/abs/2502.05003) — Hadamard normalization for 1-bit
+- [Optimal Brain Surgeon (Hassibi, 1993)](https://papers.nips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html) — foundation for GPTQ
 
 ### Additional references
-- [FBI-LLM](https://arxiv.org/abs/2407.07093) — first proof binary {-1,+1} LLMs work at 7B
-- [OneBit — SVID decomposition](https://arxiv.org/abs/2402.11295) (NeurIPS 2024) — W = sign(W) * outer(a,b), 13.5B token training
-- [BitNet b1.58](https://arxiv.org/abs/2402.17764) — ternary {-1,0,+1} training from scratch
-- [BitNet v2 — H-BitLinear](https://arxiv.org/abs/2504.18415) — online Hadamard before activation quantization
-- [QuIP# — Hadamard Incoherence](https://arxiv.org/abs/2402.04396) — randomized Hadamard for incoherence processing
-- [Rethinking 1-bit Optimization](https://arxiv.org/abs/2508.06974) — tanh progressive schedule FP→binary
+- [GKD](https://arxiv.org/abs/2306.13649) (ICLR 2024) — tunable on-policy fraction
+- [Unlikelihood Training](https://arxiv.org/abs/1908.04319) (ICLR 2020) — penalize repeated tokens
+- [PV-Tuning](https://arxiv.org/abs/2405.14852) — STE analysis for extreme compression
+- [TinyBERT](https://arxiv.org/abs/1909.10351) (EMNLP 2020) — multi-layer distillation
+- [BitDistill](https://arxiv.org/abs/2510.13998) — hidden state distillation for 1-bit
+- [AWQ](https://arxiv.org/abs/2306.00978) (MLSys 2024) — activation-aware weight quantization
+- [EfficientQAT](https://arxiv.org/abs/2407.11062) (ACL 2025) — block-wise QAT
+- [BitNet b1.58](https://arxiv.org/abs/2402.17764) — ternary training from scratch
+- [BitNet v2](https://arxiv.org/abs/2504.18415) — H-BitLinear
+- [QuIP#](https://arxiv.org/abs/2402.04396) — Hadamard incoherence
+- [Rethinking 1-bit Optimization](https://arxiv.org/abs/2508.06974) — tanh progressive schedule
 - [ARB-LLM](https://arxiv.org/abs/2410.03129) — alternating refined binarizations
 - [Binary Neural Networks for LLMs: A Survey](https://arxiv.org/abs/2502.19008)
 - [BiLLM](https://arxiv.org/abs/2402.04291) — PTQ for LLMs

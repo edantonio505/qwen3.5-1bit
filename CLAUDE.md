@@ -223,21 +223,18 @@ v8 (running) — Full OneBit architecture from their actual codebase:
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 
-Six research-backed changes, each tied to a specific paper:
+v8 implements OneBit's actual architecture (from GitHub codebase audit, not just the paper):
 
-| Change | Paper | arXiv | Key Technique |
-|--------|-------|-------|---------------|
-| On-policy distillation | MiniLLM | 2306.08543 | Reverse KL + student rollouts (fixes generation collapse) |
-| On-policy mix ratio | GKD | 2306.13649 | Tunable on-policy fraction |
-| Unlikelihood loss | Unlikelihood Training | 1908.04319 | Penalize repeated tokens during training |
-| Clipped STE | PV-Tuning | 2405.14852 | Zero grad for weights far from decision boundary |
-| Multi-layer distillation | TinyBERT | 1909.10351 | Match hidden states at layers 7,15,23,31 |
-| Hidden state distill (last layer) | BitDistill | 2510.13998 | Original motivation for hidden state matching |
-| Block-wise QAT | EfficientQAT | 2407.11062 | Freeze/unfreeze blocks to reduce VRAM |
-| Activation-weighted GPTQ | AWQ | 2306.00978 | Weight sign-flip priority by activation magnitude |
-| GPTQ init | "What Makes Low-Bit QAT Work" | 2601.14888 | Hessian-optimal binary weights as QAT starting point |
-| Hadamard rotation | QuEST / QuIP# | 2502.05003 / 2402.04396 | Spread outlier energy before binarization |
-| Binary LLM feasibility | FBI-LLM | 2407.07093 | Proves {-1,+1} LLMs work at 7B scale |
+| Fix | Source File | arXiv | What It Does |
+|-----|-------------|-------|-------------|
+| **LayerNorm in BitLinear** | OneBit bitnet.py | 2402.11295 | **PRIMARY FIX.** Re-normalizes activations every layer → prevents generation collapse |
+| **Tanh-STE** | OneBit bitnet.py | 2402.11295 | Smooth gradient gate: plastic near 0, frozen far from 0 |
+| **NMF init + w=sign(W)*0.01** | OneBit build_start_ckpt.py | 2402.11295 | Non-negative factorization + max gradient flow at start |
+| **All-layer directional alignment** | OneBit kd.py | 2402.11295 | L2-normalized MSE every layer (dominant). KD logit loss 100x down |
+| **LR 1e-4, beta2=0.98** | OneBit llama_7b.sh | 2402.11295 | 20x higher LR, responsive optimizer |
+| On-policy distillation | MiniLLM | 2306.08543 | Student generates during training (15% of steps) |
+| GPTQ Phase 1 | GPTQ + QuEST | 2210.17323 / 2502.05003 | Hessian calibration + Hadamard for initial signs |
+| Binary LLM proof | FBI-LLM | 2407.07093 | Proved {-1,+1} works at 7B + distillation-only loss is best |
 
 **CRITICAL INSIGHT: LayerNorm inside BitLinear prevents generation collapse (v8 finding):**
 OneBit's actual codebase (bitnet.py) has `nn.LayerNorm(out_features, elementwise_affine=False)`
