@@ -75,22 +75,20 @@ git clone https://github.com/edantonio505/qwen3.5-1bit.git
 cd qwen3.5-1bit
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# CURRENT best command for 8B (v5: GPTQ init + QAT):
+# CURRENT best command for 8B (v8: full OneBit architecture):
+pip install scikit-learn  # needed for NMF init
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B \
-    --use-4bit-teacher \
-    --max-steps 3000 \
-    --gen-check-interval 200 \
-    --eval-interval 500 \
-    --output-dir quantize/runs/v5-qwen3-8b \
-    2>&1 | tee run_v5.log
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
+    --max-examples 30000 --epochs 50 --lr 1e-4 \
+    --gen-check-interval 200 --eval-interval 1000 \
+    --output-dir quantize/runs/v8-qwen3-8b \
+    --use-svid --simple-loss \
+    --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
+    2>&1 | tee run_v8.log
 
-# Previous (v4.3 — loss converges but generation collapses):
-# python3 quantize/run_v4.py --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000
-
-# Legacy (simpler, no scheduled sampling):
-# python3 quantize/run_cloud.py --model Qwen/Qwen3-8B
+# If GPTQ checkpoint exists, add: --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
+# Previous versions (all failed at generation — see run history below)
 ```
 
 If OOM, reduce batch/seq: `--batch-size 1 --seq-len 512`
@@ -289,7 +287,7 @@ OpenHermes × 50 epochs. Future improvement: generate synthetic data from teache
 
 ```
 quantize/
-├── run_v5.py          # CURRENT: v5 — GPTQ init + QAT with hidden state distillation
+├── run_v5.py          # CURRENT: v8 — full OneBit architecture (LayerNorm + tanh-STE + NMF + all-layer alignment)
 ├── run_v4.py          # v4.3 QAT with BitLinear — loss converges but gen collapses
 ├── gptq_1bit.py       # GPTQ 1-bit PTQ with Hadamard rotation + sign-flip refinement
 ├── run_cloud.py       # Cloud QAT with BitLinear + 4-bit teacher, auto-detects GPUs/VRAM/arch

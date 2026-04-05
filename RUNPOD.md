@@ -176,7 +176,7 @@ Research agent audited OneBit's GitHub codebase, found 5 critical missing featur
 
 ```
 quantize/
-├── run_v5.py         # CURRENT: v5 — GPTQ init + QAT + hidden state distillation
+├── run_v5.py         # CURRENT: v8 — full OneBit architecture (LayerNorm + tanh-STE + NMF + all-layer alignment)
 ├── gptq_1bit.py      # GPTQ 1-bit PTQ: Hadamard, sign-flip refinement, layer-wise calibration
 ├── run_v4.py         # v4.3 — BitLinear QAT (loss converges but gen collapses)
 ├── run_cloud.py      # Cloud training (multi-GPU, 4-bit teacher, auto-detect, BitLinear)

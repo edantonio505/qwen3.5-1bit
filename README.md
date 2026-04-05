@@ -6,7 +6,7 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 
 ## Status
 
-**Active: v7 training run on 2x A100 80GB.** SVID decomposition (OneBit, NeurIPS 2024) + simple loss (soft CE + hidden MSE only) + 30k examples × 50 epochs for repetition. Prior runs (v4.3-v6) all showed loss converging but generation collapsing — root cause identified as multi-term loss creating conflicting gradients + insufficient data repetition. v7 follows the OneBit recipe that actually worked in published research.
+**Active: v8 training run on 2x A100 80GB.** Full OneBit architecture from codebase audit: LayerNorm inside every BitLinear (THE primary fix for generation collapse), tanh-STE, NMF init with weight=sign(W)*0.01, all-layer directional alignment as dominant loss, LR=1e-4. Prior runs (v4.3-v7) all had good training loss but broken generation — root cause: missing LayerNorm causes activation explosion during autoregressive generation.
 
 ## Quick Start — Training
 
@@ -85,7 +85,7 @@ auditing their actual GitHub codebase.
 
 ```
 quantize/
-├── run_v5.py         # CURRENT: v5 — GPTQ init + QAT + hidden state distillation
+├── run_v5.py         # CURRENT: v8 — full OneBit architecture (LayerNorm + tanh-STE + NMF + all-layer alignment)
 ├── gptq_1bit.py      # GPTQ 1-bit PTQ: Hadamard rotation, sign-flip refinement, layer-wise calibration
 ├── run_v4.py         # v4.3: BitLinear QAT (loss converges but generation collapses)
 ├── run_cloud.py      # Cloud training (multi-GPU, 4-bit teacher, auto-detect, BitLinear)
