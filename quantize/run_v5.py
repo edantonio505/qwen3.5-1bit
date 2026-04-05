@@ -1210,6 +1210,19 @@ def main():
                         student.train()
                         torch.cuda.empty_cache()
 
+                # Periodic checkpoint every 500 steps (crash recovery)
+                if step % 500 == 0 and step > 0:
+                    try:
+                        ckpt_dir = Path(args.output_dir) / f"checkpoint-{step}"
+                        ckpt_dir.mkdir(parents=True, exist_ok=True)
+                        cpu_state = {k: v.cpu() for k, v in student.state_dict().items()}
+                        torch.save(cpu_state, ckpt_dir / "model.pt")
+                        del cpu_state
+                        tok.save_pretrained(ckpt_dir)
+                        print(f"  Checkpoint saved: {ckpt_dir}")
+                    except Exception as e:
+                        print(f"  Checkpoint save failed: {e}")
+
                 # Full eval
                 if step % args.eval_interval == 0:
                     try:
