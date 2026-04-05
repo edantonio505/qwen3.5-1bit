@@ -14,15 +14,16 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 # Install dependencies
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 8B model — CURRENT BEST (v5.3: split student + on-policy + unlikelihood + clipped STE)
+# 8B model — CURRENT BEST (v5.4: stronger unlikelihood + faster on-policy + relaxed STE)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
   python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
+    --max-examples 300000 --epochs 20 \
     --gen-check-interval 100 --eval-interval 500 \
-    --output-dir quantize/runs/v5.3-qwen3-8b \
+    --output-dir quantize/runs/v5.4-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
-    --unlikelihood-weight 0.1 --on-policy-fraction 0.2 --on-policy-len 64 --ste-clip 1.0 \
-    2>&1 | tee run_v5.3.log
+    --unlikelihood-weight 0.5 --on-policy-fraction 0.3 --on-policy-len 64 --ste-clip 2.0 \
+    2>&1 | tee run_v5.4.log
 
 # First run (no GPTQ checkpoint yet — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -192,17 +193,20 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 - On-policy distillation required 2 forward passes, pushing single-GPU student to 84 GB → OOM
 - Fix: split student across both GPUs (v5.3)
 
-### v5.3 Run (In Progress — 2026-04-04)
-- **Key change:** Student split across both GPUs via `accelerate.dispatch_model()`
-  - Layers 0-17 + embed on GPU 0 (shared with teacher)
-  - Layers 18-35 + norm + lm_head on GPU 1
-  - Peak ~50-60 GB per GPU instead of 84 GB on one
-- **All improvements active:**
-  1. **Fixed GPTQ init:** FP16 magnitudes preserved, only signs flipped to GPTQ-optimal
-  2. **Clipped STE** (PV-Tuning, 2405.14852): zeros grad for |w| > 1.0
-  3. **Unlikelihood loss** (1908.04319, weight=0.1): penalizes repeated tokens
-  4. **On-policy distillation** (MiniLLM, 2306.08543): 20% of steps, 64-token rollouts
-  5. **Hidden state MSE** (BitDistill, 2510.13998): last layer matching
+### v5.3 (killed step ~120 — hyperparameters too conservative)
+- Loss 5.79 at step 75 (slower than v4.3's 4.24)
+- Step 100 gen: `, 01. a the is and in to that for` — new repetition attractor
+- Unlikelihood weight 0.1 too weak (ul=0.006, barely registers)
+- STE clip 1.0 too aggressive (zeroed too many gradients)
+- On-policy ramp too slow (1% at step 75, needed to be active from start)
+
+### v5.4 Run (In Progress — 2026-04-05)
+- **Same infrastructure** (split GPUs, 300k data, GPTQ init) — **tuned hyperparameters:**
+  1. **Unlikelihood weight: 0.1→0.5** (5x stronger anti-repetition)
+  2. **On-policy: starts at 5%, max 30%** (was 0%→20%, too slow)
+  3. **STE clip: 1.0→2.0** (let more gradients through, faster learning)
+  4. **Fixed GPTQ init:** FP16 magnitudes + GPTQ-optimal signs
+  5. **Hidden state MSE** (BitDistill): last layer matching
   6. **GPTQ Hadamard + sign-flip** (QuEST, AWQ): Hessian-optimal signs
 
 ### Known bottleneck: data volume

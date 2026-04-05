@@ -188,11 +188,19 @@ v5.1 (OOM step 25) — on-policy distillation on single GPU:
 - On-policy rollout = 2 forward passes → 84 GB → OOM on 80 GB GPU.
 - Root cause: student on single GPU can't fit on-policy.
 
-v5.3 (running, step 75) — split student + all improvements + 300k data:
-- Loss: 8.94→5.79 at step 75 (declining, slower than v4.3 but steadier)
-- CE: 19.3→11.8 | ul=0.006 (unlikelihood active) | op=0.01 (on-policy starting)
-- GPU: 42/56 GB peak per GPU — plenty of headroom
-- First run with ALL features active without crashes
+v5.3 (killed step ~120) — split student + all improvements + 300k data:
+- Loss: 8.94→5.79 at step 75 (declining but slower than v4.3's 4.24)
+- Step 100 gen: `, 01. a the is and in to that for` — new repetition attractor
+- Unlikelihood too weak (ul=0.006 at weight 0.1, barely registers on loss 5.79)
+- On-policy too slow to ramp (op=0.01 at step 75, only 1% of steps)
+- STE clip=1.0 too aggressive — zeroed too many gradients, slowed learning
+- GPU stable at 42/56 GB — infrastructure works, hyperparameters were wrong
+
+v5.4 (running) — same infra, tuned hyperparameters:
+- Unlikelihood weight: 0.1→0.5 (5x stronger anti-repetition)
+- On-policy: starts at 5% immediately (was 0%), max 30% (was 20%)
+- STE clip: 1.0→2.0 (let more gradients through)
+- 300k examples × 20 epochs, split GPUs — same as v5.3
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 
@@ -310,16 +318,17 @@ True binary only — NEVER ternary {-1,0,+1}.
 5. If no: launch without those flags (runs ~15 min GPTQ Phase 1 first)
 6. Monitor: `tail -f run_v5.3.log`
 
-**Current best launch command (v5.3):**
+**Current best launch command (v5.4):**
 ```bash
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
   python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
+    --max-examples 300000 --epochs 20 \
     --gen-check-interval 100 --eval-interval 500 \
-    --output-dir quantize/runs/v5.3-qwen3-8b \
+    --output-dir quantize/runs/v5.4-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
-    --unlikelihood-weight 0.1 --on-policy-fraction 0.2 --on-policy-len 64 --ste-clip 1.0 \
-    2>&1 | tee run_v5.3.log
+    --unlikelihood-weight 0.5 --on-policy-fraction 0.3 --on-policy-len 64 --ste-clip 2.0 \
+    2>&1 | tee run_v5.4.log
 ```
 
 **GPU layout (v5.3):**
@@ -341,6 +350,7 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_
 - v5.0: GPTQ binary values as weights → flat gradients, worse than v4.3 (killed step 3)
 - v5.1: on-policy OOM'd at step 25 — student on single GPU couldn't fit 2 forward passes
 - v5.2: killed before results — replaced by v5.3 with split student
+- v5.3: unlikelihood too weak (0.1), STE clip too aggressive (1.0), on-policy too slow to ramp
 - ProgressiveQuantizedLinear on 8B → OOM. Use BitLinear only.
 - KL divergence → explodes to 3600+. Use normalized MSE + cosine instead.
 - Student on single GPU + on-policy → OOM at 84 GB. Must split student across both GPUs.

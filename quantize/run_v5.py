@@ -453,12 +453,16 @@ def get_sampling_ratio(step, total_steps):
     return 0.1 + 0.2 * step / max(ramp_end, 1)
 
 
-def get_on_policy_fraction(step, total_steps, max_fraction=0.2):
-    """Ramp on-policy fraction from 0 to max_fraction by step 1000."""
-    ramp_end = min(1000, total_steps // 3)
+def get_on_policy_fraction(step, total_steps, max_fraction=0.2, min_fraction=0.05):
+    """Ramp on-policy fraction from min_fraction to max_fraction by step 500.
+
+    v5.3 showed on-policy at 1% was too low to matter by step 100.
+    Start at 5% so it's active from the beginning.
+    """
+    ramp_end = min(500, total_steps // 4)
     if step >= ramp_end:
         return max_fraction
-    return max_fraction * step / max(ramp_end, 1)
+    return min_fraction + (max_fraction - min_fraction) * step / max(ramp_end, 1)
 
 
 # ══════════════════════════════════════════════════════════

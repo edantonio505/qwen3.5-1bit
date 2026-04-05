@@ -10,15 +10,16 @@ cd qwen3.5-1bit
 # 2. Install deps
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 3. Run v5.3 (CURRENT BEST — split student + on-policy + unlikelihood + clipped STE)
+# 3. Run v5.4 (CURRENT BEST — stronger unlikelihood + faster on-policy + relaxed STE)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
   python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
+    --max-examples 300000 --epochs 20 \
     --gen-check-interval 100 --eval-interval 500 \
-    --output-dir quantize/runs/v5.3-qwen3-8b \
+    --output-dir quantize/runs/v5.4-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
-    --unlikelihood-weight 0.1 --on-policy-fraction 0.2 --on-policy-len 64 --ste-clip 1.0 \
-    2>&1 | tee run_v5.3.log
+    --unlikelihood-weight 0.5 --on-policy-fraction 0.3 --on-policy-len 64 --ste-clip 2.0 \
+    2>&1 | tee run_v5.4.log
 
 # First run (no GPTQ checkpoint — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -127,16 +128,18 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 - Root cause: initializing self.weight with GPTQ ±scale values, not smooth FP16
 
 ### v5.1 (OOM at step 25 — on-policy + single-GPU student = 84 GB)
-### v5.3 run in progress (2026-04-04)
-- **Student split across both GPUs** via accelerate.dispatch_model()
-  - Layers 0-17 + embed → GPU 0 (shared with teacher)
-  - Layers 18-35 + norm + lm_head → GPU 1
-  - Peak ~50-60 GB/GPU instead of 84 GB on one
-- Fixed GPTQ init: keep FP16 magnitudes, flip signs to match GPTQ-optimal
-- Clipped STE (PV-Tuning, 2405.14852): zero grad for |w| > 1.0
-- Unlikelihood loss (1908.04319, weight=0.1): penalize repeated tokens
-- On-policy distillation (MiniLLM, 2306.08543): 20% steps, 64-token rollouts — now fits!
-- Known bottleneck: 400x insufficient data (OneBit used 13.5B tokens, we use ~18M)
+### v5.3 (killed step ~120 — hyperparameters too conservative)
+- Loss 5.79 at step 75 (slower than v4.3's 4.24)
+- Gen at step 100: `, 01. a the is and in to` — new repetition attractor
+- Unlikelihood 0.1 too weak, STE clip 1.0 too aggressive, on-policy ramp too slow
+
+### v5.4 run in progress (2026-04-05)
+- **Same split-GPU infra** — student across both GPUs, 300k examples, 20 epochs
+- **Tuned hyperparameters based on v5.3 findings:**
+  - Unlikelihood: 0.1→0.5 (5x stronger)
+  - On-policy: starts at 5% (was 0%), max 30% (was 20%)
+  - STE clip: 1.0→2.0 (more gradients, faster learning)
+- Known bottleneck: data volume (3B tokens vs OneBit's 13.5B)
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically
