@@ -917,7 +917,7 @@ def main():
                             del t_gen_out, t_gen
                         # Student forward on its own generated sequence
                         s_out_op = student(input_ids=gen_ids, attention_mask=gen_mask)
-                        s_logits_op = s_out_op.logits
+                        s_logits_op = s_out_op.logits.to(loss_device)
                         del s_out_op
                         # On-policy soft CE loss (student should match teacher on its OWN sequences)
                         t_probs = F.softmax(t_logits_op, dim=-1)
@@ -935,14 +935,14 @@ def main():
                     s_out = student(input_ids=mixed_ids,
                                     attention_mask=s_batch["attention_mask"],
                                     output_hidden_states=True)
-                    s_logits = s_out.logits
-                    s_hidden = s_out.hidden_states[-1]
+                    s_logits = s_out.logits.to(loss_device)
+                    s_hidden = s_out.hidden_states[-1].to(loss_device)
                     del s_out
 
                     loss, mse_v, cos_v, ce_v, hmse_v, ul_v = compute_loss(
                         s_logits, t_logits, labels, s_hidden, t_hidden,
                         ul_weight=args.unlikelihood_weight,
-                        input_ids=mixed_ids.to(s_logits.device))
+                        input_ids=mixed_ids.to(loss_device))
                     del s_logits, t_logits, s_hidden, t_hidden
 
                     # Add on-policy loss if this step used it
