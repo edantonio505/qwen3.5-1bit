@@ -170,7 +170,7 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 - Clipped STE — better gradient quality through sign()
 - 300k examples × 20 epochs ≈ 3B tokens (166x more than v4.3)
 
-### v4.3 Run (In Progress — 2026-04-04)
+### v4.3 Run (killed step 300 — 2026-04-04)
 - **Setup:** 2x A100 80GB, Qwen3-8B, 4-bit teacher, BitLinear student
 - **Config:** batch=1, seq=512, grad_accum=16, 8-bit AdamW, lr=5e-6 (scales: 5e-5)
 - **Data:** 35,160 examples (30k OpenHermes chat + 5.1k QA)

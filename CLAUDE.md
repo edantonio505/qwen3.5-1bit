@@ -351,7 +351,7 @@ True binary only — NEVER ternary {-1,0,+1}.
 3. Check if GPTQ checkpoint exists: `ls quantize/runs/v5-qwen3-8b/gptq_checkpoint/group_scales.pt`
 4. If yes: launch with `--skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint`
 5. If no: launch without those flags (runs ~15 min GPTQ Phase 1 first)
-6. Monitor: `tail -f run_v5.3.log`
+6. Monitor: `tail -f run_v8.log`
 
 **Current best launch command (v8 — full OneBit architecture):**
 ```bash
