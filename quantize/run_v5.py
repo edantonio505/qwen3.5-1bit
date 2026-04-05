@@ -149,6 +149,73 @@ class BitLinear(nn.Module):
         return F.linear(x, q_w, self.bias)
 
 
+class STESign(torch.autograd.Function):
+    """Simple STE for sign() — used by SVIDBitLinear.
+    Returns {-1, +1} in forward, passes gradient straight through in backward.
+    """
+    @staticmethod
+    def forward(ctx, weight):
+        signs = weight.sign()
+        signs[signs == 0] = 1.0
+        return signs
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad  # straight-through
+
+
+class SVIDBitLinear(nn.Module):
+    """1-bit linear with Sign-Value Independent Decomposition (OneBit, NeurIPS 2024).
+
+    Instead of: w_q = per_group_scale * sign(w)   (one scale per 128 weights)
+    Uses:       w_q = sign(w) * alpha_i * beta_j   (value vectors per layer)
+
+    Each weight gets its own effective scale (alpha_i * beta_j) from two
+    small FP16 vectors. This is MORE expressive than per-group scales while
+    using FEWER parameters.
+
+    For a 4096x4096 layer:
+    - Per-group scales: 131,072 FP16 params (one per 128 weights)
+    - SVID vectors: 8,192 FP16 params (4096 + 4096)
+    - But SVID gives 16.7M unique scales vs 131k shared scales
+
+    Reference: OneBit (arXiv:2402.11295, NeurIPS 2024)
+    "We decompose W = S ⊙ (α · β^T) where S = sign(W)"
+    """
+
+    def __init__(self, orig: nn.Linear, gptq_weight=None):
+        super().__init__()
+        self.in_features = orig.in_features
+        self.out_features = orig.out_features
+        self.bias = orig.bias
+
+        # Master weight — keep FP16 for smooth gradient landscape
+        if gptq_weight is not None:
+            gptq_signs = gptq_weight.sign()
+            orig_signs = orig.weight.data.sign()
+            flip_mask = (gptq_signs != orig_signs)
+            new_weight = orig.weight.data.clone()
+            new_weight[flip_mask] = -new_weight[flip_mask]
+            self.weight = nn.Parameter(new_weight)
+        else:
+            self.weight = orig.weight
+
+        # SVID value vectors — initialized from weight statistics
+        with torch.no_grad():
+            w = self.weight.data.float()
+            # α_i = sqrt(mean(W[i,:]^2)) — row-wise RMS
+            self.alpha = nn.Parameter(w.pow(2).mean(dim=1).sqrt().to(self.weight.dtype))
+            # β_j = sqrt(mean(W[:,j]^2)) — column-wise RMS
+            self.beta = nn.Parameter(w.pow(2).mean(dim=0).sqrt().to(self.weight.dtype))
+
+    def forward(self, x):
+        # Sign matrix via STE
+        signs = STESign.apply(self.weight)
+        # SVID: W_q = sign(W) ⊙ (α ⊗ β^T)
+        q_w = signs * self.alpha.unsqueeze(1) * self.beta.unsqueeze(0)
+        return F.linear(x, q_w, self.bias)
+
+
 # ══════════════════════════════════════════════════════════
 #  Phase 1: GPTQ Calibration
 # ══════════════════════════════════════════════════════════
@@ -277,9 +344,40 @@ def replace_linears_from_gptq(model, gptq_scales_dict, skip_patterns=None):
     return replaced
 
 
-# ══════════════════════════════════════════════════════════
+def replace_linears_svid(model, gptq_scales_dict=None, skip_patterns=None):
+    """Replace nn.Linear with SVIDBitLinear (OneBit SVID decomposition)."""
+    if skip_patterns is None:
+        skip_patterns = ["norm", "layernorm", "rmsnorm", "embed", "lm_head"]
+
+    layers = get_layers(model)
+    replaced = skipped = 0
+
+    for layer_idx, layer in enumerate(layers):
+        linears = find_linears(layer, skip_patterns=skip_patterns)
+        for name, linear in linears.items():
+            gptq_w = linear.weight.data.clone() if gptq_scales_dict is not None else None
+
+            parts = name.split(".")
+            parent = layer
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, parts[-1], SVIDBitLinear(linear, gptq_weight=gptq_w))
+            replaced += 1
+
+    for name, mod in model.named_modules():
+        for cname, child in mod.named_children():
+            full = f"{name}.{cname}" if name else cname
+            if isinstance(child, nn.Linear) and not isinstance(child, (BitLinear, SVIDBitLinear)):
+                if any(pat in full.lower() for pat in skip_patterns):
+                    skipped += 1
+
+    print(f"  Replaced {replaced} layers with SVIDBitLinear (OneBit) | Skipped: {skipped}")
+    return replaced
+
+
+# ═══��════════════════════════════���═════════════════════════
 #  System Detection & Config (from v4.3)
-# ══════════════════════════════════════════════════════════
+# ═���═══════════════════════════��════════════════════════════
 
 def detect_system():
     info = {"arch": platform.machine(), "num_gpus": 0, "gpu_names": [],
@@ -355,32 +453,49 @@ def unlikelihood_loss(logits, input_ids, context_window=16):
 
 
 def compute_loss(s_logits, t_logits, labels, s_hidden=None, t_hidden=None,
-                 ul_weight=0.0, input_ids=None):
-    """Normalized MSE + cosine + CE + hidden MSE + unlikelihood.
+                 ul_weight=0.0, input_ids=None, simple_loss=False):
+    """Loss function with two modes:
 
-    Loss weights:
-      - Normalized logit MSE: 0.4
-      - Cosine similarity: 0.2
-      - Cross-entropy: 0.4
-      - Hidden state MSE: 0.1 (if hidden states provided)
-      - Unlikelihood: ul_weight (default 0.1, if input_ids provided)
+    simple_loss=True (OneBit recipe — RECOMMENDED):
+      Soft CE (teacher probs as targets) + hidden state MSE. Two terms only.
+      FBI-LLM proved distillation-only loss outperforms combined losses.
+      OneBit (NeurIPS 2024) used exactly this recipe to achieve working 1-bit.
+
+    simple_loss=False (legacy 5-term loss):
+      Normalized MSE (0.4) + cosine (0.2) + CE (0.4) + hidden MSE (0.1) + UL
     """
     V = s_logits.size(-1)
 
+    if simple_loss:
+        # ═══ OneBit/FBI-LLM recipe: soft CE + hidden MSE ═══
+        # Soft CE: student matches full teacher distribution
+        t_probs = F.softmax(t_logits.detach(), dim=-1)
+        s_log_probs = F.log_softmax(s_logits, dim=-1)
+        soft_ce = -(t_probs * s_log_probs).sum(dim=-1).mean()
+
+        total = soft_ce
+
+        # Hidden state MSE (normalized, last layer)
+        h_mse_v = 0.0
+        if s_hidden is not None and t_hidden is not None:
+            s_h = s_hidden / s_hidden.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            t_h = t_hidden / t_hidden.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            h_mse = F.mse_loss(s_h, t_h.detach())
+            total = total + 1.0 * h_mse  # weight 1.0 as in OneBit
+            h_mse_v = h_mse.item()
+
+        return total, soft_ce.item(), 0.0, 0.0, h_mse_v, 0.0
+
+    # ═══ Legacy 5-term loss ═══
     # Normalized logit MSE
     s_norm = (s_logits - s_logits.mean(-1, keepdim=True)) / s_logits.std(-1, keepdim=True).clamp(min=1e-6)
     t_norm = (t_logits - t_logits.mean(-1, keepdim=True)) / t_logits.std(-1, keepdim=True).clamp(min=1e-6)
     mse = F.mse_loss(s_norm, t_norm)
 
-    # Cosine similarity
     cos = 1.0 - F.cosine_similarity(s_logits, t_logits, dim=-1).mean()
-
-    # Cross-entropy
     ce = F.cross_entropy(s_logits.view(-1, V), labels.view(-1), ignore_index=-100)
-
     total = 0.4 * mse + 0.2 * cos + 0.4 * ce
 
-    # Hidden state MSE (last layer before lm_head)
     h_mse_v = 0.0
     if s_hidden is not None and t_hidden is not None:
         s_h = (s_hidden - s_hidden.mean(-1, keepdim=True)) / s_hidden.std(-1, keepdim=True).clamp(min=1e-6)
@@ -389,7 +504,6 @@ def compute_loss(s_logits, t_logits, labels, s_hidden=None, t_hidden=None,
         total = total + 0.1 * h_mse
         h_mse_v = h_mse.item()
 
-    # Unlikelihood loss (Change 2) — penalize repeated tokens
     ul_v = 0.0
     if ul_weight > 0 and input_ids is not None:
         ul = unlikelihood_loss(s_logits, input_ids, context_window=16)
@@ -417,20 +531,20 @@ def mix_with_student_predictions(student, input_ids, attention_mask, sampling_ra
 
 
 @torch.no_grad()
-def generate_on_policy_sequences(student, input_ids, attention_mask, max_new=64):
-    """Generate sequences using student's own greedy decoding (Change 1).
+def generate_on_policy_sequences(student, input_ids, attention_mask, max_new=32,
+                                  prefix_tokens=32, temperature=0.8):
+    """Generate sequences using student's own sampling (Change 1, improved).
 
-    Takes first half of input_ids as prompt prefix, then lets the student
-    generate max_new tokens autoregressively. Returns the full sequence
-    (prefix + generated) and an attention mask.
-
-    This is the core of on-policy distillation: the student must learn to
-    produce coherent output from its OWN distribution, not teacher-forced tokens.
+    Uses a SHORT prefix (32 tokens, not T//2) so the model must generate
+    most of the sequence on its own — practicing recovery from errors.
+    Uses temperature sampling (not greedy) to explore diverse sequences
+    and avoid locking into attractor modes.
 
     Reference: MiniLLM (arXiv:2306.08543), GKD (arXiv:2306.13649)
     """
     B, T = input_ids.shape
-    prefix_len = max(T // 2, 1)
+    prefix_len = min(prefix_tokens, T // 2)
+    prefix_len = max(prefix_len, 1)
     prefix_ids = input_ids[:, :prefix_len]
     prefix_mask = attention_mask[:, :prefix_len]
 
@@ -439,7 +553,9 @@ def generate_on_policy_sequences(student, input_ids, attention_mask, max_new=64)
 
     for _ in range(max_new):
         out = student(input_ids=gen_ids, attention_mask=gen_mask)
-        next_token = out.logits[:, -1:].argmax(dim=-1)  # (B, 1)
+        logits = out.logits[:, -1:] / max(temperature, 1e-6)
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs.squeeze(1), 1)  # (B, 1)
         gen_ids = torch.cat([gen_ids, next_token], dim=1)
         gen_mask = torch.cat([gen_mask, torch.ones(B, 1, device=gen_mask.device, dtype=gen_mask.dtype)], dim=1)
 
@@ -682,6 +798,10 @@ def main():
                         help="Max tokens generated in on-policy rollouts")
     parser.add_argument("--ste-clip", type=float, default=1.0,
                         help="STE clipping threshold (Change 3, 0 to disable)")
+    parser.add_argument("--use-svid", action="store_true",
+                        help="Use OneBit SVID decomposition instead of per-group scales")
+    parser.add_argument("--simple-loss", action="store_true",
+                        help="Use OneBit loss recipe: soft CE + hidden MSE only (recommended)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -775,14 +895,18 @@ def main():
     print(f"  Teacher: {tgb:.2f} GB")
 
     # ── Student from GPTQ checkpoint — split across both GPUs ──
-    print("[3/5] Student (GPTQ-initialized BitLinear, split across GPUs)...")
+    quant_mode = "SVIDBitLinear (OneBit)" if args.use_svid else "BitLinear"
+    print(f"[3/5] Student ({quant_mode}, split across GPUs)...")
     student = AutoModelForCausalLM.from_pretrained(
         gptq_path, dtype=torch.bfloat16,
         trust_remote_code=True, attn_implementation="sdpa",
     )
     gptq_scales = torch.load(Path(gptq_path) / "group_scales.pt", weights_only=True)
-    replace_linears_from_gptq(student, gptq_scales,
-                               skip_patterns=["norm", "layernorm", "rmsnorm", "embed", "lm_head"])
+    skip = ["norm", "layernorm", "rmsnorm", "embed", "lm_head"]
+    if args.use_svid:
+        replace_linears_svid(student, gptq_scales_dict=gptq_scales, skip_patterns=skip)
+    else:
+        replace_linears_from_gptq(student, gptq_scales, skip_patterns=skip)
     student.gradient_checkpointing_enable()
 
     if multi_gpu:
@@ -848,8 +972,12 @@ def main():
     warmup = max(1, int(total_steps * 0.05))
 
     # ── Optimizer ──
-    scale_p = [p for n, p in student.named_parameters() if "log_scale" in n]
-    other_p = [p for n, p in student.named_parameters() if "log_scale" not in n and p.requires_grad]
+    # SVID uses alpha/beta vectors; BitLinear uses log_scale. Both get 10x LR.
+    scale_names = ["log_scale", "alpha", "beta"]
+    scale_p = [p for n, p in student.named_parameters()
+               if any(sn in n for sn in scale_names) and p.requires_grad]
+    other_p = [p for n, p in student.named_parameters()
+               if not any(sn in n for sn in scale_names) and p.requires_grad]
     groups = [{"params": other_p, "lr": args.lr}]
     if scale_p:
         groups.append({"params": scale_p, "lr": args.lr * 10})
@@ -868,7 +996,10 @@ def main():
     print(f"    Unlikelihood: {args.unlikelihood_weight} (0=disabled)")
     print(f"    On-policy:  {args.on_policy_fraction*100:.0f}% max, {args.on_policy_len} tokens")
     print(f"    Sampling:   10%→30% (fallback)")
-    print(f"    Loss:       MSE(0.4) + cos(0.2) + CE(0.4) + h_MSE(0.1) + UL({args.unlikelihood_weight})")
+    if args.simple_loss:
+        print(f"    Loss:       SIMPLE — soft CE + hidden MSE (OneBit recipe)")
+    else:
+        print(f"    Loss:       MSE(0.4) + cos(0.2) + CE(0.4) + h_MSE(0.1) + UL({args.unlikelihood_weight})")
     print()
 
     # ── Train ──
@@ -946,7 +1077,8 @@ def main():
                     loss, mse_v, cos_v, ce_v, hmse_v, ul_v = compute_loss(
                         s_logits, t_logits, labels, s_hidden, t_hidden,
                         ul_weight=args.unlikelihood_weight,
-                        input_ids=mixed_ids.to(loss_device))
+                        input_ids=mixed_ids.to(loss_device),
+                        simple_loss=args.simple_loss)
                     del s_logits, t_logits, s_hidden, t_hidden
 
                     # Add on-policy loss if this step used it

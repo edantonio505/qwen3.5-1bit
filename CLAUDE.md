@@ -196,11 +196,24 @@ v5.3 (killed step ~120) — split student + all improvements + 300k data:
 - STE clip=1.0 too aggressive — zeroed too many gradients, slowed learning
 - GPU stable at 42/56 GB — infrastructure works, hyperparameters were wrong
 
-v5.4 (running) — same infra, tuned hyperparameters:
-- Unlikelihood weight: 0.1→0.5 (5x stronger anti-repetition)
-- On-policy: starts at 5% immediately (was 0%), max 30% (was 20%)
-- STE clip: 1.0→2.0 (let more gradients through)
-- 300k examples × 20 epochs, split GPUs — same as v5.3
+v5.4 (killed step 75) — stronger hyperparameters, same trajectory:
+- Loss 5.86 at step 75 — same as v5.3. Tuning hyperparameters didn't help.
+- Confirmed: the problem is structural, not hyperparameters.
+
+v6 (killed step 1000) — SVID + 500k data + 10k steps:
+- SVID decomposition: each weight gets unique scale (a_i × b_j). Lower MSE/cos from step 1.
+- Loss: 9.95→4.89→2.87→2.24 (steepest drop of any run, still declining at step 1000)
+- BUT gen at step 1000: "Okayimport import list_list" — new degenerate attractor. Eval 0/8.
+- **Root cause: 5-term loss (MSE+cos+CE+h_MSE+UL) creates conflicting gradients.**
+  Model finds compromise that satisfies all terms but produces degenerate generation.
+- FBI-LLM proved distillation-only loss outperforms combined losses.
+
+v7 (running) — SVID + simple loss + 30k×50 epochs:
+- **Simple loss (OneBit recipe): soft CE + hidden MSE ONLY.** No MSE, no cosine, no hard CE, no UL.
+- 30k examples × 50 epochs (not 500k×1 epoch): repetition > diversity for 1-bit sign learning
+- On-policy with temperature=0.8, prefix=32 tokens (explores diverse sequences)
+- Starting loss: 18.8 (soft CE over 151k vocab — higher number but cleaner signal)
+- This is the first run matching what actually worked in published research.
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 
@@ -220,29 +233,28 @@ Six research-backed changes, each tied to a specific paper:
 | Hadamard rotation | QuEST / QuIP# | 2502.05003 / 2402.04396 | Spread outlier energy before binarization |
 | Binary LLM feasibility | FBI-LLM | 2407.07093 | Proves {-1,+1} LLMs work at 7B scale |
 
-**Why on-policy distillation is critical (MiniLLM):**
-Standard KD uses forward KL which forces the student to spread probability everywhere the teacher
-has mass — causing mode averaging → incoherent generation. Reverse KL (on student-generated
-sequences) is mode-seeking: the student commits to one coherent mode the teacher supports. This
-directly fixes the `\n\n` attractor / generation collapse problem.
+**CRITICAL INSIGHT: Simple loss > complex loss for 1-bit (v6/v7 finding):**
+FBI-LLM proved that distillation-only soft CE outperforms combined losses. OneBit uses just
+soft CE + hidden state MSE. Our 5-term loss (MSE+cos+CE+h_MSE+UL) caused conflicting gradients —
+the model found degenerate modes that minimized some terms while ignoring others (v4.3: `\n\n`,
+v5.3: `, 01.`, v6: `Okayimport`). v7 uses ONLY soft CE + hidden MSE (OneBit recipe).
 
-**Why unlikelihood loss helps (arXiv 1908.04319):**
-MLE training causes the model to assign too much probability to repeated tokens. At 1-bit where
-outputs are weak, the model falls into repeating the highest-probability token. Unlikelihood loss
-penalizes `log(1 - p(token))` for recently-seen tokens, breaking the repetition attractor.
+**CRITICAL INSIGHT: Repetition > diversity for 1-bit:**
+At 1-bit, each weight is a single sign bit. The optimizer can only flip signs. To correctly
+set 8B sign bits, each example must be seen MANY times (OneBit: 50 epochs). Seeing 500k unique
+examples once (v6) is worse than seeing 30k examples ~5 times (v7). Repetition hammers
+the gradient signal to flip signs correctly.
 
-**Why clipped STE matters (PV-Tuning):**
-Vanilla STE passes all gradients through sign() unchanged. For weights far from ±1, this gradient
-is maximally inaccurate. Clipped STE zeros gradients for |w| > 1, focusing learning on weights
-near the decision boundary where sign flips matter most.
+**On-policy distillation (MiniLLM, arXiv 2306.08543):**
+Standard KD uses forward KL → mode averaging → incoherent generation. On-policy uses student-
+generated sequences with temperature sampling (0.8) from short prefixes (32 tokens), forcing
+the model to practice recovery from its own errors. 15% of training steps.
 
-**GPTQ init fix (v5.1):** Original v5 initialized BitLinear weights from GPTQ binary values
-(flat gradient landscape). Fixed in v5.1: keep FP16 magnitudes but flip signs to match GPTQ
-Hessian-optimal signs. Smooth landscape + optimal signs.
+**GPTQ init fix (v5.1):** Keep FP16 magnitudes, only flip signs to match GPTQ Hessian-optimal.
+Binary values as weights give flat gradient landscape (v5.0 finding).
 
-**Data volume insight (OneBit, NeurIPS 2024):**
-Every working 1-bit method used 400-70,000x more data than our 35k examples. OneBit used 13.5B
-tokens (132k examples × 2048 seq × 50 epochs). This remains a key bottleneck to address.
+**Data volume:** OneBit used 13.5B tokens (132k × 2048 × 50 epochs). v7 uses 30k × 512 × 50
+epochs ≈ 768M tokens. Still less but with repetition emphasis matching OneBit's approach.
 
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
@@ -277,18 +289,18 @@ quantize/
 - Activation-weighted priority for sign flips (AWQ, arXiv 2306.00978)
 - Saves calibrated checkpoint with optimal binary weights + group scales
 
-**Phase 2 — QAT Fine-tuning (multi-GPU):**
-- **Init:** FP16 magnitudes preserved, signs flipped to match GPTQ Hessian-optimal signs
-- **STE:** Clipped STE — zeros gradients for |w| > 1.0 (PV-Tuning, arXiv 2405.14852)
-- **Loss:** Normalized logit MSE (0.4) + cosine (0.2) + CE (0.4) + hidden MSE (0.1) + unlikelihood (0.1)
-- **Unlikelihood:** Penalizes log(1-p) for tokens seen in last 16 positions (arXiv 1908.04319)
-- **On-policy distillation:** 20% of steps, student generates 64 tokens from prompt prefix,
-  soft CE computed between student/teacher on student-generated sequences (MiniLLM, arXiv 2306.08543)
-- **Teacher:** Frozen 4-bit NF4 on GPU 0
-- **Student:** GPTQ-initialized BitLinear on GPU 1
-- **Data mix:** 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + custom factual)
+**Phase 2 — QAT Fine-tuning (v7 — current best, multi-GPU):**
+- **Quantizer:** SVIDBitLinear (OneBit SVID): `w_q = sign(w) * alpha_i * beta_j` per layer
+- **Init:** FP16 magnitudes preserved, signs flipped to match GPTQ Hessian-optimal
+- **Loss:** `--simple-loss` — soft CE (teacher probs as targets) + hidden state MSE (OneBit recipe)
+  - NO normalized MSE, NO cosine, NO hard CE, NO unlikelihood
+  - FBI-LLM proved single-objective distillation outperforms multi-term losses
+- **On-policy:** 15% of steps, temp=0.8 sampling from 32-token prefix (explores diverse sequences)
+- **Data:** 30k examples × 50 epochs — repetition > diversity for sign bit learning
+- **Teacher:** Frozen 4-bit NF4 on GPU 0 (shared with student layers 0-17)
+- **Student:** Split across both GPUs via accelerate.dispatch_model()
 - **Skipped layers:** Embedding + LM head kept in FP16
-- **Optimizer:** 8-bit AdamW with separate LR for scale params (10x multiplier)
+- **Optimizer:** 8-bit AdamW, 10x LR for SVID alpha/beta vectors
 
 ### GPU Requirements
 
@@ -318,17 +330,19 @@ True binary only — NEVER ternary {-1,0,+1}.
 5. If no: launch without those flags (runs ~15 min GPTQ Phase 1 first)
 6. Monitor: `tail -f run_v5.3.log`
 
-**Current best launch command (v5.4):**
+**Current best launch command (v7 — OneBit recipe):**
 ```bash
-PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
-    --max-examples 300000 --epochs 20 \
-    --gen-check-interval 100 --eval-interval 500 \
-    --output-dir quantize/runs/v5.4-qwen3-8b \
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
+    --max-examples 30000 --epochs 50 \
+    --gen-check-interval 200 --eval-interval 1000 \
+    --output-dir quantize/runs/v7-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
-    --unlikelihood-weight 0.5 --on-policy-fraction 0.3 --on-policy-len 64 --ste-clip 2.0 \
-    2>&1 | tee run_v5.4.log
+    --use-svid --simple-loss \
+    --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 \
+    --unlikelihood-weight 0 \
+    2>&1 | tee run_v7.log
 ```
 
 **GPU layout (v5.3):**
@@ -351,7 +365,11 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_
 - v5.1: on-policy OOM'd at step 25 — student on single GPU couldn't fit 2 forward passes
 - v5.2: killed before results — replaced by v5.3 with split student
 - v5.3: unlikelihood too weak (0.1), STE clip too aggressive (1.0), on-policy too slow to ramp
-- ProgressiveQuantizedLinear on 8B → OOM. Use BitLinear only.
+- v5.4: same trajectory as v5.3 despite stronger hyperparameters — problem is structural not tuning
+- v6 SVID+500k: loss dropped to 2.24 but gen "Okayimport" attractor, 0/8. 5-term loss is the problem.
+- 5-term loss (MSE+cos+CE+h_MSE+UL) → conflicting gradients → degenerate generation modes
+- 500k examples seen once < 30k examples seen 5+ times (repetition matters for 1-bit)
+- ProgressiveQuantizedLinear on 8B → OOM. Use BitLinear/SVIDBitLinear only.
 - KL divergence → explodes to 3600+. Use normalized MSE + cosine instead.
 - Student on single GPU + on-policy → OOM at 84 GB. Must split student across both GPUs.
 - 35k examples is 400x too little data. Scale data if current approach fails.

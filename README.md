@@ -6,7 +6,7 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 
 ## Status
 
-**Active: v5 training run on 2x A100 80GB.** Two-phase pipeline: (1) GPTQ calibration with Hadamard rotation for optimal binary weight initialization, (2) QAT fine-tuning with hidden state distillation. v4.3 proved loss converges but generation collapses with naive sign(w) init — research shows GPTQ initialization yields 15x better results.
+**Active: v7 training run on 2x A100 80GB.** SVID decomposition (OneBit, NeurIPS 2024) + simple loss (soft CE + hidden MSE only) + 30k examples × 50 epochs for repetition. Prior runs (v4.3-v6) all showed loss converging but generation collapsing — root cause identified as multi-term loss creating conflicting gradients + insufficient data repetition. v7 follows the OneBit recipe that actually worked in published research.
 
 ## Quick Start — Training
 
@@ -14,16 +14,17 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 # Install dependencies
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 8B model — CURRENT BEST (v5.4: stronger unlikelihood + faster on-policy + relaxed STE)
-PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
+# 8B model — CURRENT BEST (v7: SVID + simple loss + repetition)
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
-    --max-examples 300000 --epochs 20 \
-    --gen-check-interval 100 --eval-interval 500 \
-    --output-dir quantize/runs/v5.4-qwen3-8b \
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
+    --max-examples 30000 --epochs 50 \
+    --gen-check-interval 200 --eval-interval 1000 \
+    --output-dir quantize/runs/v7-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
-    --unlikelihood-weight 0.5 --on-policy-fraction 0.3 --on-policy-len 64 --ste-clip 2.0 \
-    2>&1 | tee run_v5.4.log
+    --use-svid --simple-loss \
+    --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
+    2>&1 | tee run_v7.log
 
 # First run (no GPTQ checkpoint yet — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -57,21 +58,22 @@ w_i = scale * (2 * bit_i - 1)    bit_i in {0, 1}
 
 Effective: 1.125 bits/weight. A Qwen3-8B model compresses from 16.4 GB to ~1.15 GB.
 
-### Training Approach (v5.1 — GPTQ Init + On-Policy + Unlikelihood + Clipped STE)
+### Training Approach (v7 — OneBit Recipe: SVID + Simple Loss + Repetition)
 
 | Component | Paper | Technique |
 |---|---|---|
-| **Phase 1: GPTQ init** | "What Makes Low-Bit QAT Work" (2601.14888) | Hessian-based calibration + Hadamard rotation + sign-flip refinement |
-| **Phase 1: AWQ weighting** | AWQ (2306.00978) | Activation-magnitude priority for sign-flip refinement |
-| **Phase 2: GPTQ-init BitLinear** | — | FP16 magnitudes preserved, signs flipped to match GPTQ Hessian-optimal |
-| **Clipped STE** | PV-Tuning (2405.14852) | Zero gradient for weights with \|w\| > 1.0 — focuses learning on decision boundary |
-| **On-policy distillation** | MiniLLM (2306.08543) / GKD (2306.13649) | 20% of steps: student generates 64 tokens, soft CE vs teacher on student sequences |
-| **Unlikelihood loss** | Unlikelihood Training (1908.04319) | Penalize log(1-p) for tokens in last 16 positions — breaks repetition attractor |
-| **Hidden state MSE** | BitDistill (2510.13998) / TinyBERT (1909.10351) | Match last transformer layer output between teacher and student |
-| **Distillation loss** | — | Normalized logit MSE (0.4) + cosine (0.2) + CE (0.4) + hidden MSE (0.1) + UL (0.1) |
-| **Data mix** | — | 60% OpenHermes chat + 40% QA (TriviaQA + GSM8K + custom factual) |
-| **Teacher** | — | Frozen 4-bit NF4 on GPU 0 |
-| **Optimizer** | — | 8-bit AdamW, 10x LR for scale params |
+| **SVID decomposition** | OneBit (2402.11295, NeurIPS 2024) | `w_q = sign(w) * alpha_i * beta_j` — unique scale per weight via value vectors |
+| **Simple loss** | FBI-LLM (2407.07093) / OneBit | Soft CE (teacher probs as targets) + hidden state MSE. NO other terms. |
+| **Phase 1: GPTQ init** | "What Makes Low-Bit QAT Work" (2601.14888) | Hessian calibration + Hadamard rotation. Signs flipped, FP16 magnitudes kept. |
+| **On-policy distillation** | MiniLLM (2306.08543) | 15% of steps: student generates 32 tokens with temp=0.8 from short prefix |
+| **Data strategy** | OneBit | 30k examples × 50 epochs — repetition > diversity for sign bit learning |
+| **Student split** | — | Split across both GPUs via accelerate.dispatch_model() (~40 GB/GPU) |
+| **Teacher** | — | Frozen 4-bit NF4 on GPU 0 (shared with student layers 0-17) |
+| **Optimizer** | — | 8-bit AdamW, 10x LR for SVID alpha/beta vectors |
+
+**Why simple loss matters (v6 finding):** Our 5-term loss (MSE+cos+CE+h_MSE+UL) caused the model
+to find degenerate modes satisfying all terms simultaneously ("Okayimport" attractor at v6 step 1000).
+With just soft CE + hidden MSE, there's ONE clear signal: match the teacher's distribution.
 
 ### Key Files
 
@@ -200,18 +202,24 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 - STE clip 1.0 too aggressive (zeroed too many gradients)
 - On-policy ramp too slow (1% at step 75, needed to be active from start)
 
-### v5.4 Run (In Progress — 2026-04-05)
-- **Same infrastructure** (split GPUs, 300k data, GPTQ init) — **tuned hyperparameters:**
-  1. **Unlikelihood weight: 0.1→0.5** (5x stronger anti-repetition)
-  2. **On-policy: starts at 5%, max 30%** (was 0%→20%, too slow)
-  3. **STE clip: 1.0→2.0** (let more gradients through, faster learning)
-  4. **Fixed GPTQ init:** FP16 magnitudes + GPTQ-optimal signs
-  5. **Hidden state MSE** (BitDistill): last layer matching
-  6. **GPTQ Hadamard + sign-flip** (QuEST, AWQ): Hessian-optimal signs
+### v5.4 (killed step 75 — same trajectory as v5.3)
+- Stronger hyperparameters didn't change trajectory. Problem is structural, not tuning.
 
-### Known bottleneck: data volume
-OneBit (NeurIPS 2024) used 13.5B tokens. We use ~18M tokens (400x less). Every working
-1-bit method used orders of magnitude more data. If v5.3 fails, scaling data is the next pivot.
+### v6 (killed step 1000 — 5-term loss causes degenerate attractors)
+- SVID + 500k data. Loss: 9.95→2.24 (best ever). But gen: "Okayimport import list_list". Eval 0/8.
+- **Root cause: 5-term loss (MSE+cos+CE+h_MSE+UL) creates conflicting gradients.** Model finds
+  compromise modes that satisfy all terms but produce degenerate generation.
+- 500k examples seen once < 30k examples seen multiple times (repetition matters).
+
+### v7 Run (In Progress — 2026-04-05)
+- **Key changes based on v6 failure analysis:**
+  1. **Simple loss (OneBit recipe):** soft CE + hidden MSE ONLY. No MSE/cos/CE/UL.
+     FBI-LLM proved distillation-only loss outperforms combined losses.
+  2. **30k × 50 epochs (not 500k × 1):** repetition > diversity for 1-bit sign learning
+  3. **SVID decomposition** (OneBit): each weight gets unique scale (a_i × b_j)
+  4. **On-policy with temp=0.8, prefix=32:** explores diverse sequences, avoids attractor lock-in
+- **Early results:** soft CE starting at 18.8, training cleanly with simple loss
+- **ETA:** ~78 hours for 10k steps
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.

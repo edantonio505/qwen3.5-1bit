@@ -10,16 +10,17 @@ cd qwen3.5-1bit
 # 2. Install deps
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 3. Run v5.4 (CURRENT BEST — stronger unlikelihood + faster on-policy + relaxed STE)
-PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1 \
+# 3. Run v7 (CURRENT BEST — SVID + simple loss + repetition)
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 3000 \
-    --max-examples 300000 --epochs 20 \
-    --gen-check-interval 100 --eval-interval 500 \
-    --output-dir quantize/runs/v5.4-qwen3-8b \
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
+    --max-examples 30000 --epochs 50 \
+    --gen-check-interval 200 --eval-interval 1000 \
+    --output-dir quantize/runs/v7-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
-    --unlikelihood-weight 0.5 --on-policy-fraction 0.3 --on-policy-len 64 --ste-clip 2.0 \
-    2>&1 | tee run_v5.4.log
+    --use-svid --simple-loss \
+    --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
+    2>&1 | tee run_v7.log
 
 # First run (no GPTQ checkpoint — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -133,13 +134,20 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 - Gen at step 100: `, 01. a the is and in to` — new repetition attractor
 - Unlikelihood 0.1 too weak, STE clip 1.0 too aggressive, on-policy ramp too slow
 
-### v5.4 run in progress (2026-04-05)
-- **Same split-GPU infra** — student across both GPUs, 300k examples, 20 epochs
-- **Tuned hyperparameters based on v5.3 findings:**
-  - Unlikelihood: 0.1→0.5 (5x stronger)
-  - On-policy: starts at 5% (was 0%), max 30% (was 20%)
-  - STE clip: 1.0→2.0 (more gradients, faster learning)
-- Known bottleneck: data volume (3B tokens vs OneBit's 13.5B)
+### v5.4 (killed step 75 — same trajectory as v5.3, hyperparameter tuning didn't help)
+
+### v6 (killed step 1000 — 5-term loss causes degenerate attractors)
+- SVID + 500k data. Loss 9.95→2.24 (best ever), BUT gen "Okayimport" attractor, 0/8 eval
+- Root cause: multi-term loss creates conflicting gradients → degenerate generation modes
+- 500k unique examples seen once < 30k examples with repetition
+
+### v7 run in progress (2026-04-05) — OneBit recipe
+- **Simple loss:** soft CE + hidden MSE ONLY (OneBit/FBI-LLM recipe)
+- **SVID decomposition:** each weight gets unique scale (alpha_i × beta_j)
+- **30k examples × 50 epochs:** repetition > diversity for 1-bit sign learning
+- **On-policy:** 15% of steps, temp=0.8, prefix=32 tokens
+- Starting soft CE: 18.8, 10k steps, ETA ~78 hours
+- **Rationale:** first run matching what actually worked in published research
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically
