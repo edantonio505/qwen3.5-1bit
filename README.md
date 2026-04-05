@@ -99,9 +99,11 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 | Qwen3-8B | 4-bit teacher + student single GPU + on-policy | ~84 GB peak | OOM on 80GB | Yes (v5.1 OOM) |
 | Qwen3.5-35B | 4-bit teacher + student | ~380 GB | 8x A100 80GB | Estimated |
 
-**A single 80GB GPU (A100) will OOM on 8B.** Peak memory during backward hits ~78 GB for student alone; teacher needs another ~6 GB.
+**Split student across both GPUs (v5.3 layout):** Student layers 0-17 on GPU 0 (shared with teacher), layers 18-35 on GPU 1. Peak ~56 GB per GPU. Required for on-policy distillation (2 forward passes per step).
 
-**ProgressiveQuantizedLinear also OOMs on 8B** (even on 80GB) due to blending intermediates. Use BitLinear for 8B+.
+**Student on single GPU will OOM with on-policy:** Peaks at 84 GB (v5.1 finding). Without on-policy, single GPU works but generation collapses.
+
+**ProgressiveQuantizedLinear also OOMs on 8B** due to blending intermediates. Use BitLinear for 8B+.
 
 **Note:** 24GB GPUs (RTX 3090/4090) cannot fit even the 2B model due to optimizer states and activations.
 
@@ -137,16 +139,27 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 - BitLinear with int8 sign storage fits 8B on 80 GB GPUs
 - 4-bit teacher via bitsandbytes NF4 saves ~12 GB VRAM
 - 8-bit AdamW via bitsandbytes saves ~16 GB optimizer memory
-- Multi-GPU split (teacher GPU 0, student GPU 1) for 8B
+- **Split student across both GPUs** via accelerate.dispatch_model() — peak ~56 GB/GPU
 - Training loss converges consistently across all runs
-- Mixed QA + chat data (14% QA) provides both factual and conversational coverage
 - Gradient checkpointing essential for 8B
+- **GPTQ init with FP16 magnitudes + sign flips** — better than both naive init and raw GPTQ
+- **Clipped STE** — slower learning but more accurate gradients at 1-bit
+- **Unlikelihood loss** — actively trains against repetition (ul > 0 from step ~20)
 
-### What Doesn't Work Yet
-- Generation produces English word fragments but not correct answers (as of step 225)
-- ProgressiveQuantizedLinear too memory-intensive for 8B (use BitLinear instead)
-- Progressive noise schedule incompatible with 8B memory budget (skip directly to 1-bit)
-- CUDA async errors crash gen checks — need try/except + synchronize wrappers
+### What Doesn't Work
+- **Generation still collapses** with naive init + teacher forcing (v4.3)
+- ProgressiveQuantizedLinear on 8B → OOM (use BitLinear)
+- GPTQ binary values as weight init → flat gradients (keep FP16 magnitudes instead)
+- Student on single GPU + on-policy → OOM at 84 GB (must split across GPUs)
+- KL divergence → explodes to 3600+ (use MSE + cosine)
+- CUDA async errors crash gen checks → try/except + synchronize + CUDA_LAUNCH_BLOCKING=1
+- **18M tokens (35k examples) is 400x too little** — scaled to 300k examples in v5.3
+
+### Under Test (v5.3)
+- On-policy distillation (MiniLLM) — first principled fix for generation collapse
+- Unlikelihood loss — training against repetition attractor
+- Clipped STE — better gradient quality through sign()
+- 300k examples × 20 epochs ≈ 3B tokens (166x more than v4.3)
 
 ### v4.3 Run (In Progress — 2026-04-04)
 - **Setup:** 2x A100 80GB, Qwen3-8B, 4-bit teacher, BitLinear student

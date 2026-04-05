@@ -119,17 +119,35 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 - **Fix:** `BitLinear` (in run_v4.py and run_cloud.py) saves signs as int8 (1 byte = 50% savings), does no blending, pure 1-bit from start
 - Peak memory with BitLinear: **78 GB** vs 84+ GB (OOM) with ProgressiveQuantizedLinear
 
-**2x A100 80GB multi-GPU setup (confirmed working):**
+**2x A100 80GB split-student layout (v5.3, confirmed working):**
 - Teacher (4-bit NF4) on GPU 0: ~6.4 GB
-- Student (BitLinear) on GPU 1: ~16.5 GB → peaks at ~78 GB during backward
+- Student layers 0-17 + embed on GPU 0: ~8 GB → peaks ~42 GB with optimizer/grads
+- Student layers 18-35 + norm + lm_head on GPU 1: ~8 GB → peaks ~39 GB with optimizer/grads
+- Split via `accelerate.dispatch_model()` with manual device_map
+- Total peak ~56 GB per GPU — fits on-policy distillation (2 forward passes per step)
 - Config: batch=1, seq=512, grad_accum=16, 8-bit AdamW
-- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` helps with fragmentation
-- Teacher logits `.detach().to(student_device)` — cross-GPU transfer, then free teacher KV cache
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + `CUDA_LAUNCH_BLOCKING=1`
 
-**Single A100 80GB is NOT enough for 8B QAT:**
-- Even with BitLinear, student alone peaks at ~78 GB during backward
-- Teacher needs another ~6 GB on a separate GPU
-- Use 160GB+ single GPU or 2x 40GB+ multi-GPU
+**Student on single GPU will OOM with on-policy distillation:**
+- Student alone peaks at ~78 GB during backward (v4.3 config)
+- On-policy adds a second forward pass → 84 GB → OOM on 80 GB GPU
+- **Must split student across both GPUs** for on-policy to work
+- Without on-policy, single GPU works but generation collapses (v4.3 result)
+
+**GPTQ binary init hurts optimization (v5.0 finding):**
+- Initializing BitLinear.weight with GPTQ quantized values (±scale) gives flat gradient landscape
+- v5.0 starting loss was WORSE than v4.3 (8.89 vs 8.62)
+- **Fix (v5.1+):** Keep original FP16 weight magnitudes, only flip signs to match GPTQ Hessian-optimal
+- `gptq_signs = gptq_weight.sign(); flip where gptq_signs != orig_signs; negate weight at those positions`
+- Smooth FP16 landscape for optimizer + Hessian-optimal sign decisions
+
+**Data volume is a critical bottleneck:**
+- Every working 1-bit method used 400-70,000x more data than our early runs (18M tokens)
+- OneBit (NeurIPS 2024): 13.5B tokens (132k examples × 2048 seq × 50 epochs)
+- FBI-LLM: 108B tokens on 16-32 A100s
+- v5.3 raised to 300k examples (from 30k) × 512 seq × 20 epochs ≈ 3B tokens
+- OpenHermes has 1M examples — we only use 300k. Can scale further if needed.
+- SlimPajama (627B tokens) and FineWeb-Edu (1.3T tokens) available on HuggingFace for future scaling
 
 **Memory optimizations (all applied in run_v4.py and run_cloud.py):**
 - Student loaded on CPU first, quantized, then moved to GPU
@@ -156,13 +174,25 @@ Every weight is binary: `w_i = scale_g * (2*bit_i - 1)` where `bit_i ∈ {0,1}` 
 - `CUDA_LAUNCH_BLOCKING=1` env var makes kernels synchronous (pinpoints errors, ~30% slower)
 - After fix, training continues even if gen check fails
 
-**v4.3 proved loss converges but generation doesn't (killed at step 300):**
-- Loss: 8.6→4.2→2.6→2.0→1.9 (plateauing at ~1.9)
-- CE: 19→8.8→5.1→3.8→3.6 (slowing dramatically: delta only -0.12 over last 75 steps)
-- Step 200 gen: gibberish → English word fragments, but incoherent ("Nowonenatorinaeseinged")
-- **Root cause:** Naive `sign(w)` initialization. The model starts from terrible binary weights
-  and can only recover so far. Research shows GPTQ initialization yields 15x better results.
-- **Decision:** Killed v4.3, built v5 with GPTQ init + QAT
+**Complete run history:**
+
+v4.3 (killed step 300) — naive sign(w) init, single-GPU student:
+- Loss: 8.6→4.2→2.6→2.0→1.9 (plateaued). Gen: English fragments, never answers.
+- Root cause: naive initialization + teacher forcing exposure bias.
+
+v5.0 (killed step 3) — GPTQ binary values as weights:
+- Loss 8.89 (WORSE than v4.3). GPTQ binary values gave flat gradient landscape.
+- Root cause: should keep FP16 magnitudes, only flip signs.
+
+v5.1 (OOM step 25) — on-policy distillation on single GPU:
+- On-policy rollout = 2 forward passes → 84 GB → OOM on 80 GB GPU.
+- Root cause: student on single GPU can't fit on-policy.
+
+v5.3 (running, step 75) — split student + all improvements + 300k data:
+- Loss: 8.94→5.79 at step 75 (declining, slower than v4.3 but steadier)
+- CE: 19.3→11.8 | ul=0.006 (unlikelihood active) | op=0.01 (on-policy starting)
+- GPU: 42/56 GB peak per GPU — plenty of headroom
+- First run with ALL features active without crashes
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 

@@ -90,6 +90,10 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 | KV cache fragments | OOM on generation checks | `torch.cuda.empty_cache()` before/after eval |
 | CUDA async errors at gen checks | `illegal memory access` at `empty_cache()` | try/except + `torch.cuda.synchronize()` before gen, `CUDA_LAUNCH_BLOCKING=1` |
 | 8-bit AdamW lazy init memory spike | 16 GB jump at step 2 (states created on first `opt.step()`) | Expected behavior — budget for it; without 8-bit would be 32 GB |
+| On-policy + single-GPU student | OOM at 84 GB (2 forward passes per step) | Split student across both GPUs via `accelerate.dispatch_model()` |
+| GPTQ binary values as weight init | Flat gradient landscape, loss worse than naive | Keep FP16 magnitudes, only flip signs to match GPTQ Hessian-optimal |
+| Device mismatch with split model | `Expected all tensors on same device` | Explicit `.to(loss_device)` on all student outputs before loss computation |
+| 35k examples insufficient for 1-bit | Loss plateaus, gen never improves | Raise to 300k+ examples, 20 epochs (OneBit used 13.5B tokens) |
 
 ### What we tried on DIGITS (128GB, GB10)
 
