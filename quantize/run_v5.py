@@ -149,38 +149,46 @@ class BitLinear(nn.Module):
         return F.linear(x, q_w, self.bias)
 
 
-class STESign(torch.autograd.Function):
-    """Simple STE for sign() — used by SVIDBitLinear.
-    Returns {-1, +1} in forward, passes gradient straight through in backward.
+class TanhSTE(torch.autograd.Function):
+    """Tanh-STE for sign() — from OneBit's actual implementation.
+
+    Instead of passing all gradients (vanilla STE) or clipping (our v5.3 attempt),
+    gates gradient by (1.001 - tanh(w)²):
+    - w ≈ 0 (near decision boundary): gate ≈ 1.0 → full gradient, encourage sign decisions
+    - |w| >> 0 (committed sign): gate ≈ 0.0 → suppress gradient, sign is stable
+
+    This is a smooth curriculum: weights near zero are plastic (can change sign),
+    weights far from zero are frozen. Focuses learning on uncertain weights.
+
+    Reference: OneBit (arXiv:2402.11295) — transformers/src/transformers/models/bitnet.py
     """
     @staticmethod
     def forward(ctx, weight):
+        ctx.save_for_backward(weight)
         signs = weight.sign()
         signs[signs == 0] = 1.0
         return signs
 
     @staticmethod
     def backward(ctx, grad):
-        return grad  # straight-through
+        weight, = ctx.saved_tensors
+        # Tanh-STE: gradient gated by derivative of tanh
+        gate = 1.001 - torch.tanh(weight) ** 2
+        return grad * gate
 
 
 class SVIDBitLinear(nn.Module):
-    """1-bit linear with Sign-Value Independent Decomposition (OneBit, NeurIPS 2024).
+    """1-bit linear with OneBit's full architecture (NeurIPS 2024).
 
-    Instead of: w_q = per_group_scale * sign(w)   (one scale per 128 weights)
-    Uses:       w_q = sign(w) * alpha_i * beta_j   (value vectors per layer)
+    Key components from OneBit's actual codebase:
+    1. SVID: w_q = sign(w) * alpha_i * beta_j (value vectors per layer)
+    2. LayerNorm(elementwise_affine=False) on output of EVERY layer
+       → THIS IS THE PRIMARY FIX for generation collapse
+       → Prevents activation magnitude explosion during autoregressive generation
+    3. Tanh-STE for sign gradient (smooth gate, not vanilla pass-through)
+    4. Weight initialized to sign(W) * 0.01 (maximum gradient flow at start)
 
-    Each weight gets its own effective scale (alpha_i * beta_j) from two
-    small FP16 vectors. This is MORE expressive than per-group scales while
-    using FEWER parameters.
-
-    For a 4096x4096 layer:
-    - Per-group scales: 131,072 FP16 params (one per 128 weights)
-    - SVID vectors: 8,192 FP16 params (4096 + 4096)
-    - But SVID gives 16.7M unique scales vs 131k shared scales
-
-    Reference: OneBit (arXiv:2402.11295, NeurIPS 2024)
-    "We decompose W = S ⊙ (α · β^T) where S = sign(W)"
+    Reference: OneBit (arXiv:2402.11295) — bitnet.py, build_start_ckpt.py
     """
 
     def __init__(self, orig: nn.Linear, gptq_weight=None):
@@ -189,31 +197,54 @@ class SVIDBitLinear(nn.Module):
         self.out_features = orig.out_features
         self.bias = orig.bias
 
-        # Master weight — keep FP16 for smooth gradient landscape
-        if gptq_weight is not None:
-            gptq_signs = gptq_weight.sign()
-            orig_signs = orig.weight.data.sign()
-            flip_mask = (gptq_signs != orig_signs)
-            new_weight = orig.weight.data.clone()
-            new_weight[flip_mask] = -new_weight[flip_mask]
-            self.weight = nn.Parameter(new_weight)
-        else:
-            self.weight = orig.weight
+        # FIX 1: LayerNorm inside every BitLinear (THE KEY)
+        # Prevents activation explosion during generation. Without this,
+        # each 1-bit layer amplifies errors by O(√d) and by layer 20
+        # the model is in a completely different activation space.
+        self.layernorm = nn.LayerNorm(self.out_features, elementwise_affine=False)
 
-        # SVID value vectors — initialized from weight statistics
+        # FIX 3: Weight = sign(W) * 0.01 (not sign(W) * 1.0)
+        # Small magnitude → tanh-STE gives 100% gradient flow initially
+        # → full exploration of sign landscape in early training
+        if gptq_weight is not None:
+            signs = gptq_weight.sign()
+            signs[signs == 0] = 1.0
+            self.weight = nn.Parameter(signs * 0.01)
+        else:
+            signs = orig.weight.data.sign()
+            signs[signs == 0] = 1.0
+            self.weight = nn.Parameter(signs * 0.01)
+
+        # FIX 3: NMF initialization for alpha/beta
+        # NMF on |W| gives non-negative factors matching magnitude semantics
+        # Falls back to RMS if sklearn not available
         with torch.no_grad():
-            w = self.weight.data.float()
-            # α_i = sqrt(mean(W[i,:]^2)) — row-wise RMS
-            self.alpha = nn.Parameter(w.pow(2).mean(dim=1).sqrt().to(self.weight.dtype))
-            # β_j = sqrt(mean(W[:,j]^2)) — column-wise RMS
-            self.beta = nn.Parameter(w.pow(2).mean(dim=0).sqrt().to(self.weight.dtype))
+            w_abs = orig.weight.data.float().abs()
+            try:
+                from sklearn.decomposition import NMF
+                import numpy as np
+                nmf = NMF(n_components=1, init='random', random_state=42, max_iter=200)
+                W_col = nmf.fit_transform(w_abs.cpu().numpy())  # (out, 1)
+                H_row = nmf.components_                          # (1, in)
+                alpha_init = torch.from_numpy(W_col.squeeze(1)).to(orig.weight.dtype)
+                beta_init = torch.from_numpy(H_row.squeeze(0)).to(orig.weight.dtype)
+            except ImportError:
+                # Fallback: RMS initialization
+                alpha_init = w_abs.pow(2).mean(dim=1).sqrt().to(orig.weight.dtype)
+                beta_init = w_abs.pow(2).mean(dim=0).sqrt().to(orig.weight.dtype)
+            self.alpha = nn.Parameter(alpha_init)  # weight_scale (out_features,)
+            self.beta = nn.Parameter(beta_init)    # input_factor (in_features,)
 
     def forward(self, x):
-        # Sign matrix via STE
-        signs = STESign.apply(self.weight)
-        # SVID: W_q = sign(W) ⊙ (α ⊗ β^T)
-        q_w = signs * self.alpha.unsqueeze(1) * self.beta.unsqueeze(0)
-        return F.linear(x, q_w, self.bias)
+        # OneBit forward: scale input → binary matmul → scale output → LayerNorm
+        x_scaled = x * self.beta.unsqueeze(0)                    # scale input by beta
+        signs = TanhSTE.apply(self.weight)                        # FIX 2: tanh-STE
+        output = F.linear(x_scaled, signs)                        # binary matmul
+        output = output * self.alpha.unsqueeze(0)                 # scale output by alpha
+        output = self.layernorm(output)                           # FIX 1: normalize every layer
+        if self.bias is not None:
+            output = output + self.bias
+        return output
 
 
 # ══════════════════════════════════════════════════════════
@@ -467,24 +498,40 @@ def compute_loss(s_logits, t_logits, labels, s_hidden=None, t_hidden=None,
     V = s_logits.size(-1)
 
     if simple_loss:
-        # ═══ OneBit/FBI-LLM recipe: soft CE + hidden MSE ═══
-        # Soft CE: student matches full teacher distribution
-        t_probs = F.softmax(t_logits.detach(), dim=-1)
-        s_log_probs = F.log_softmax(s_logits, dim=-1)
-        soft_ce = -(t_probs * s_log_probs).sum(dim=-1).mean()
+        # ═══ OneBit actual recipe (from llama_factory/kd.py) ═══
+        # Term 1: KL divergence (soft CE), scaled DOWN 100x
+        kd_loss = F.kl_div(
+            F.log_softmax(s_logits, dim=-1),
+            F.softmax(t_logits.detach(), dim=-1),
+            reduction="batchmean"
+        )
 
-        total = soft_ce
-
-        # Hidden state MSE (normalized, last layer)
-        h_mse_v = 0.0
+        # Term 2: Per-layer normalized directional alignment (DOMINANT term)
+        # Uses ALL hidden states, L2-normalized — compares DIRECTIONS not magnitudes
+        pkd_loss = 0.0
         if s_hidden is not None and t_hidden is not None:
-            s_h = s_hidden / s_hidden.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            t_h = t_hidden / t_hidden.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            h_mse = F.mse_loss(s_h, t_h.detach())
-            total = total + 1.0 * h_mse  # weight 1.0 as in OneBit
-            h_mse_v = h_mse.item()
+            # s_hidden and t_hidden are lists of all layer hidden states
+            if isinstance(s_hidden, (list, tuple)) and len(s_hidden) > 1:
+                for s_h, t_h in zip(s_hidden, t_hidden):
+                    s_flat = F.normalize(s_h.view(-1, s_h.shape[-1]), p=2, dim=1)
+                    t_flat = F.normalize(t_h.detach().view(-1, t_h.shape[-1]), p=2, dim=1)
+                    diff = t_flat - s_flat
+                    pkd_loss = pkd_loss + torch.mean(torch.norm(diff, p=2, dim=1) ** 2)
+            else:
+                # Single hidden state (fallback)
+                s_h = s_hidden if not isinstance(s_hidden, (list, tuple)) else s_hidden[-1]
+                t_h = t_hidden if not isinstance(t_hidden, (list, tuple)) else t_hidden[-1]
+                s_flat = F.normalize(s_h.view(-1, s_h.shape[-1]), p=2, dim=1)
+                t_flat = F.normalize(t_h.detach().view(-1, t_h.shape[-1]), p=2, dim=1)
+                diff = t_flat - s_flat
+                pkd_loss = torch.mean(torch.norm(diff, p=2, dim=1) ** 2)
 
-        return total, soft_ce.item(), 0.0, 0.0, h_mse_v, 0.0
+        # OneBit weights: kd_alpha=1.0, kd_loss_scale=0.01, kd_beta=1
+        # pkd_loss is DOMINANT, kd_loss is scaled down 100x
+        total = 0.01 * kd_loss + 1.0 * pkd_loss
+        h_mse_v = pkd_loss.item() if isinstance(pkd_loss, torch.Tensor) else pkd_loss
+
+        return total, kd_loss.item(), 0.0, 0.0, h_mse_v, 0.0
 
     # ═══ Legacy 5-term loss ═══
     # Normalized logit MSE
@@ -780,7 +827,8 @@ def main():
     parser.add_argument("--dataset", default="teknium/OpenHermes-2.5")
     parser.add_argument("--max-examples", type=int, default=30_000)
     parser.add_argument("--epochs", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Learning rate (OneBit uses 4e-4, we default 1e-4 for safety)")
     parser.add_argument("--output-dir", default="quantize/runs/v5")
     parser.add_argument("--use-4bit-teacher", action="store_true")
     parser.add_argument("--gen-check-interval", type=int, default=100)
@@ -983,10 +1031,10 @@ def main():
         groups.append({"params": scale_p, "lr": args.lr * 10})
     try:
         import bitsandbytes as bnb
-        opt = bnb.optim.AdamW8bit(groups, betas=(0.9, 0.95), weight_decay=0.01)
+        opt = bnb.optim.AdamW8bit(groups, betas=(0.9, 0.98), weight_decay=0.01)
         print("  Using 8-bit AdamW")
     except ImportError:
-        opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.01)
+        opt = torch.optim.AdamW(groups, betas=(0.9, 0.98), weight_decay=0.01)
     sched = get_cosine_schedule_with_warmup(opt, warmup, total_steps)
 
     print(f"\n  Training plan:")
@@ -1025,7 +1073,11 @@ def main():
                     with torch.amp.autocast(teacher_device.type, dtype=torch.bfloat16):
                         t_out = teacher(**t_batch, output_hidden_states=True)
                     t_logits = t_out.logits.detach().to(loss_device)
-                    t_hidden = t_out.hidden_states[-1].detach().to(loss_device)
+                    # FIX 4: pass ALL hidden states for per-layer alignment
+                    if args.simple_loss:
+                        t_hidden = [h.detach().to(loss_device) for h in t_out.hidden_states]
+                    else:
+                        t_hidden = t_out.hidden_states[-1].detach().to(loss_device)
                     del t_out, t_batch
                     if multi_gpu:
                         torch.cuda.empty_cache()
@@ -1071,7 +1123,10 @@ def main():
                                     attention_mask=s_batch["attention_mask"],
                                     output_hidden_states=True)
                     s_logits = s_out.logits.to(loss_device)
-                    s_hidden = s_out.hidden_states[-1].to(loss_device)
+                    if args.simple_loss:
+                        s_hidden = [h.to(loss_device) for h in s_out.hidden_states]
+                    else:
+                        s_hidden = s_out.hidden_states[-1].to(loss_device)
                     del s_out
 
                     loss, mse_v, cos_v, ce_v, hmse_v, ul_v = compute_loss(

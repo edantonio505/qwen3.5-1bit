@@ -10,17 +10,17 @@ cd qwen3.5-1bit
 # 2. Install deps
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 3. Run v7 (CURRENT BEST — SVID + simple loss + repetition)
+# 3. Run v8 (CURRENT BEST — full OneBit architecture with LayerNorm fix)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
-    --max-examples 30000 --epochs 50 \
+    --max-examples 30000 --epochs 50 --lr 1e-4 \
     --gen-check-interval 200 --eval-interval 1000 \
-    --output-dir quantize/runs/v7-qwen3-8b \
+    --output-dir quantize/runs/v8-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
-    2>&1 | tee run_v7.log
+    2>&1 | tee run_v8.log
 
 # First run (no GPTQ checkpoint — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -141,13 +141,18 @@ model outputs `\n\n` repeated 60 times during generation. This happens because:
 - Root cause: multi-term loss creates conflicting gradients → degenerate generation modes
 - 500k unique examples seen once < 30k examples with repetition
 
-### v7 run in progress (2026-04-05) — OneBit recipe
-- **Simple loss:** soft CE + hidden MSE ONLY (OneBit/FBI-LLM recipe)
-- **SVID decomposition:** each weight gets unique scale (alpha_i × beta_j)
-- **30k examples × 50 epochs:** repetition > diversity for 1-bit sign learning
-- **On-policy:** 15% of steps, temp=0.8, prefix=32 tokens
-- Starting soft CE: 18.8, 10k steps, ETA ~78 hours
-- **Rationale:** first run matching what actually worked in published research
+### v7 (killed — missing LayerNorm inside BitLinear)
+Research agent audited OneBit's GitHub codebase, found 5 critical missing features.
+
+### v8 run in progress (2026-04-05) — full OneBit architecture
+- **FIX 1 (PRIMARY): LayerNorm(elementwise_affine=False) inside every SVIDBitLinear**
+  → Prevents activation explosion during autoregressive generation
+  → This was THE missing feature in all prior runs (v4.3 through v7)
+- **FIX 2:** Tanh-STE: `grad * (1.001 - tanh(w)²)` (smooth gradient gate)
+- **FIX 3:** NMF init for alpha/beta + weight=sign(W)*0.01 (max gradient flow)
+- **FIX 4:** All-layer L2-normalized directional alignment (dominant loss term)
+- **FIX 5:** LR 1e-4 (was 5e-6), beta2=0.98
+- 30k examples × 50 epochs, SVID, simple loss, 10k steps
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically

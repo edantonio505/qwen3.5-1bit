@@ -14,17 +14,17 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 # Install dependencies
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 8B model — CURRENT BEST (v7: SVID + simple loss + repetition)
+# 8B model — CURRENT BEST (v8: full OneBit architecture with LayerNorm fix)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
-    --max-examples 30000 --epochs 50 \
+    --max-examples 30000 --epochs 50 --lr 1e-4 \
     --gen-check-interval 200 --eval-interval 1000 \
-    --output-dir quantize/runs/v7-qwen3-8b \
+    --output-dir quantize/runs/v8-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
-    2>&1 | tee run_v7.log
+    2>&1 | tee run_v8.log
 
 # First run (no GPTQ checkpoint yet — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -58,22 +58,28 @@ w_i = scale * (2 * bit_i - 1)    bit_i in {0, 1}
 
 Effective: 1.125 bits/weight. A Qwen3-8B model compresses from 16.4 GB to ~1.15 GB.
 
-### Training Approach (v7 — OneBit Recipe: SVID + Simple Loss + Repetition)
+### Training Approach (v8 — Full OneBit Architecture from Codebase Audit)
 
-| Component | Paper | Technique |
+| Component | Source | Technique |
 |---|---|---|
-| **SVID decomposition** | OneBit (2402.11295, NeurIPS 2024) | `w_q = sign(w) * alpha_i * beta_j` — unique scale per weight via value vectors |
-| **Simple loss** | FBI-LLM (2407.07093) / OneBit | Soft CE (teacher probs as targets) + hidden state MSE. NO other terms. |
-| **Phase 1: GPTQ init** | "What Makes Low-Bit QAT Work" (2601.14888) | Hessian calibration + Hadamard rotation. Signs flipped, FP16 magnitudes kept. |
-| **On-policy distillation** | MiniLLM (2306.08543) | 15% of steps: student generates 32 tokens with temp=0.8 from short prefix |
-| **Data strategy** | OneBit | 30k examples × 50 epochs — repetition > diversity for sign bit learning |
-| **Student split** | — | Split across both GPUs via accelerate.dispatch_model() (~40 GB/GPU) |
-| **Teacher** | — | Frozen 4-bit NF4 on GPU 0 (shared with student layers 0-17) |
-| **Optimizer** | — | 8-bit AdamW, 10x LR for SVID alpha/beta vectors |
+| **LayerNorm in BitLinear** | OneBit bitnet.py | `nn.LayerNorm(out, elementwise_affine=False)` after every binary matmul. **THE primary fix.** |
+| **Tanh-STE** | OneBit bitnet.py | `grad * (1.001 - tanh(w)²)` — smooth gradient gate |
+| **NMF init** | OneBit build_start_ckpt.py | Rank-1 NMF on \|W\| for alpha/beta. weight = sign(W) * 0.01 |
+| **All-layer alignment** | OneBit kd.py | L2-normalized MSE at every layer (dominant term). KD logit loss scaled 100x down. |
+| **SVID decomposition** | OneBit (2402.11295) | `x*beta → sign(w)@x → output*alpha → LayerNorm` |
+| **LR 1e-4, beta2=0.98** | OneBit llama_7b.sh | 20x higher LR, responsive optimizer |
+| **GPTQ init** | gptq_1bit.py | Hessian-calibrated signs as starting point |
+| **On-policy** | MiniLLM (2306.08543) | 15% of steps, temp=0.8, 32-token prefix |
+| **Data** | OneBit recipe | 30k examples × 50 epochs (repetition for sign learning) |
 
-**Why simple loss matters (v6 finding):** Our 5-term loss (MSE+cos+CE+h_MSE+UL) caused the model
-to find degenerate modes satisfying all terms simultaneously ("Okayimport" attractor at v6 step 1000).
-With just soft CE + hidden MSE, there's ONE clear signal: match the teacher's distribution.
+**Why LayerNorm inside BitLinear is critical (the bug we were missing):**
+During teacher forcing, input tokens produce bounded activations — training loss drops normally.
+During generation, the model feeds its own outputs back. At 1-bit, each binary matmul amplifies
+errors by O(√d). Without LayerNorm, by layer 20 of 36, activations have drifted completely from
+training distribution. Logits collapse to high-frequency tokens (the attractors we kept hitting:
+`\n\n`, `, 01.`, `Okayimport`). LayerNorm re-normalizes after every layer, keeping generation
+activations bounded regardless of input source. This is not in the OneBit paper — found by
+auditing their actual GitHub codebase.
 
 ### Key Files
 
@@ -211,15 +217,20 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
   compromise modes that satisfy all terms but produce degenerate generation.
 - 500k examples seen once < 30k examples seen multiple times (repetition matters).
 
-### v7 Run (In Progress — 2026-04-05)
-- **Key changes based on v6 failure analysis:**
-  1. **Simple loss (OneBit recipe):** soft CE + hidden MSE ONLY. No MSE/cos/CE/UL.
-     FBI-LLM proved distillation-only loss outperforms combined losses.
-  2. **30k × 50 epochs (not 500k × 1):** repetition > diversity for 1-bit sign learning
-  3. **SVID decomposition** (OneBit): each weight gets unique scale (a_i × b_j)
-  4. **On-policy with temp=0.8, prefix=32:** explores diverse sequences, avoids attractor lock-in
-- **Early results:** soft CE starting at 18.8, training cleanly with simple loss
-- **ETA:** ~78 hours for 10k steps
+### v7 (killed — missing LayerNorm inside BitLinear)
+- Simple loss + SVID were correct, but still missing the core OneBit architectural feature.
+- Research agent audited OneBit's actual GitHub codebase and found 5 critical differences.
+
+### v8 Run (In Progress — 2026-04-05) — Full OneBit Architecture
+Implements ALL 5 fixes found by auditing OneBit's actual codebase (github.com/xuyuzhuang11/OneBit):
+
+| Fix | What | Why |
+|-----|------|-----|
+| **1. LayerNorm in BitLinear** | `nn.LayerNorm(out, elementwise_affine=False)` after every binary matmul | **PRIMARY BUG FIX.** Prevents activation explosion during generation. Each 1-bit layer amplifies errors by O(√d); by layer 20, activations have drifted from training distribution. LayerNorm re-normalizes, keeping generation in-distribution. |
+| **2. Tanh-STE** | `grad * (1.001 - tanh(w)²)` | Smooth gate: plastic near 0 (uncertain sign), frozen far from 0 (committed sign). Better than vanilla or clipped STE. |
+| **3. NMF init + w=sign(W)*0.01** | sklearn NMF on \|W\| for alpha/beta, small weight magnitude | NMF preserves covariance structure. w=0.01 gives 100% gradient flow (vs 42% at w=1.0 with tanh-STE). |
+| **4. All-layer directional alignment** | L2-normalized MSE at every layer, pkd_loss dominant | Forces all 36 layers to track teacher's hidden state directions. KD logit loss scaled down 100x. |
+| **5. LR 1e-4, beta2=0.98** | 20x higher LR, responsive optimizer | OneBit uses 4e-4. Our 5e-6 was 80x too low — sign landscape was frozen. |
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.

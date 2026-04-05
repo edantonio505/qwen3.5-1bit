@@ -208,12 +208,20 @@ v6 (killed step 1000) — SVID + 500k data + 10k steps:
   Model finds compromise that satisfies all terms but produces degenerate generation.
 - FBI-LLM proved distillation-only loss outperforms combined losses.
 
-v7 (running) — SVID + simple loss + 30k×50 epochs:
-- **Simple loss (OneBit recipe): soft CE + hidden MSE ONLY.** No MSE, no cosine, no hard CE, no UL.
-- 30k examples × 50 epochs (not 500k×1 epoch): repetition > diversity for 1-bit sign learning
-- On-policy with temperature=0.8, prefix=32 tokens (explores diverse sequences)
-- Starting loss: 18.8 (soft CE over 151k vocab — higher number but cleaner signal)
-- This is the first run matching what actually worked in published research.
+v7 (killed — missing OneBit's core architecture):
+- Simple loss + SVID worked for training, but still 0/8 gen because we were missing
+  the critical architectural feature: LayerNorm inside every BitLinear.
+
+v8 (running) — Full OneBit architecture from their actual codebase:
+- **FIX 1 (PRIMARY BUG):** LayerNorm(elementwise_affine=False) inside every SVIDBitLinear
+  → Prevents activation magnitude explosion during autoregressive generation
+  → Without this, each 1-bit layer amplifies errors by O(√d), model diverges by layer 20
+  → THIS is why every prior run had good loss but broken generation
+- **FIX 2:** Tanh-STE: `grad * (1.001 - tanh(w)²)` — smooth gate, plastic near 0, frozen far
+- **FIX 3:** NMF init for alpha/beta + weight = sign(W) * 0.01 (max gradient flow at start)
+- **FIX 4:** All-layer normalized directional alignment (L2-norm MSE at every layer, dominant term)
+  → pkd_loss is the main signal, KD logit loss scaled down 100x
+- **FIX 5:** LR 1e-4 (was 5e-6, 20x increase), adam_beta2=0.98 (more responsive to sign flips)
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 
@@ -233,28 +241,42 @@ Six research-backed changes, each tied to a specific paper:
 | Hadamard rotation | QuEST / QuIP# | 2502.05003 / 2402.04396 | Spread outlier energy before binarization |
 | Binary LLM feasibility | FBI-LLM | 2407.07093 | Proves {-1,+1} LLMs work at 7B scale |
 
-**CRITICAL INSIGHT: Simple loss > complex loss for 1-bit (v6/v7 finding):**
-FBI-LLM proved that distillation-only soft CE outperforms combined losses. OneBit uses just
-soft CE + hidden state MSE. Our 5-term loss (MSE+cos+CE+h_MSE+UL) caused conflicting gradients —
-the model found degenerate modes that minimized some terms while ignoring others (v4.3: `\n\n`,
-v5.3: `, 01.`, v6: `Okayimport`). v7 uses ONLY soft CE + hidden MSE (OneBit recipe).
+**CRITICAL INSIGHT: LayerNorm inside BitLinear prevents generation collapse (v8 finding):**
+OneBit's actual codebase (bitnet.py) has `nn.LayerNorm(out_features, elementwise_affine=False)`
+inside EVERY BitLinear layer, applied AFTER the binary matmul and scaling. This is THE primary
+fix for generation collapse. Without it, each 1-bit layer amplifies activation errors by O(√d).
+During teacher forcing, input activations are bounded (correct tokens). During generation, the
+model feeds its own outputs back, and small errors compound through 36 layers exponentially.
+By layer 20, activations have drifted far from training distribution → logit collapse to
+high-frequency tokens. LayerNorm re-normalizes after every layer, keeping activations bounded
+regardless of whether input came from teacher or student's own generation.
 
-**CRITICAL INSIGHT: Repetition > diversity for 1-bit:**
-At 1-bit, each weight is a single sign bit. The optimizer can only flip signs. To correctly
-set 8B sign bits, each example must be seen MANY times (OneBit: 50 epochs). Seeing 500k unique
-examples once (v6) is worse than seeing 30k examples ~5 times (v7). Repetition hammers
-the gradient signal to flip signs correctly.
+**CRITICAL INSIGHT: Tanh-STE > vanilla STE > clipped STE (OneBit codebase):**
+OneBit uses `grad * (1.001 - tanh(w)²)` — a smooth gate. Weights near zero (uncertain sign)
+get full gradient. Weights far from zero (committed sign) get suppressed gradient. This is
+better than vanilla STE (all weights equal) or our clipped STE (hard cutoff at |w|>1.0).
 
-**On-policy distillation (MiniLLM, arXiv 2306.08543):**
-Standard KD uses forward KL → mode averaging → incoherent generation. On-policy uses student-
-generated sequences with temperature sampling (0.8) from short prefixes (32 tokens), forcing
-the model to practice recovery from its own errors. 15% of training steps.
+**CRITICAL INSIGHT: Weight = sign(W) * 0.01 (not sign(W) * 1.0):**
+From OneBit's build_start_ckpt.py. Small magnitude means tanh-STE gives 100% gradient flow
+at start → maximum exploration of sign landscape. Weights at ±1.0 only get 42% gradient.
+Our GPTQ init set weights to FP16 magnitudes (large) → sign landscape was frozen from step 1.
 
-**GPTQ init fix (v5.1):** Keep FP16 magnitudes, only flip signs to match GPTQ Hessian-optimal.
-Binary values as weights give flat gradient landscape (v5.0 finding).
+**CRITICAL INSIGHT: NMF for alpha/beta initialization (not RMS):**
+OneBit uses rank-1 NMF on |W| to initialize value vectors. NMF enforces non-negativity
+(matching magnitude semantics) and captures covariance structure. RMS discards this.
 
-**Data volume:** OneBit used 13.5B tokens (132k × 2048 × 50 epochs). v7 uses 30k × 512 × 50
-epochs ≈ 768M tokens. Still less but with repetition emphasis matching OneBit's approach.
+**CRITICAL INSIGHT: All-layer directional alignment is the dominant loss:**
+OneBit's actual loss (from kd.py): pkd_loss (per-layer L2-normalized MSE) is the DOMINANT term.
+KD logit loss is scaled down 100x (kd_loss_scale=0.01). Our previous runs had logit matching
+as dominant and no intermediate layer alignment → layers 1-35 could develop arbitrary internal
+representations that collapsed during generation.
+
+**CRITICAL INSIGHT: LR was 80x too low:**
+OneBit uses 4e-4. We used 5e-6. At 5e-6, weight magnitudes barely move from initialization,
+meaning the sign landscape is frozen at whatever GPTQ gave us. v8 uses 1e-4.
+
+**Data:** OneBit uses 132k teacher-generated synthetic examples, 50 epochs. We use 30k
+OpenHermes × 50 epochs. Future improvement: generate synthetic data from teacher.
 
 **PrismML Bonsai (reference target):**
 - Built from Qwen3-8B (standard dense transformer, NOT Qwen3.5 hybrid)
@@ -289,18 +311,21 @@ quantize/
 - Activation-weighted priority for sign flips (AWQ, arXiv 2306.00978)
 - Saves calibrated checkpoint with optimal binary weights + group scales
 
-**Phase 2 — QAT Fine-tuning (v7 — current best, multi-GPU):**
-- **Quantizer:** SVIDBitLinear (OneBit SVID): `w_q = sign(w) * alpha_i * beta_j` per layer
-- **Init:** FP16 magnitudes preserved, signs flipped to match GPTQ Hessian-optimal
-- **Loss:** `--simple-loss` — soft CE (teacher probs as targets) + hidden state MSE (OneBit recipe)
-  - NO normalized MSE, NO cosine, NO hard CE, NO unlikelihood
-  - FBI-LLM proved single-objective distillation outperforms multi-term losses
-- **On-policy:** 15% of steps, temp=0.8 sampling from 32-token prefix (explores diverse sequences)
-- **Data:** 30k examples × 50 epochs — repetition > diversity for sign bit learning
-- **Teacher:** Frozen 4-bit NF4 on GPU 0 (shared with student layers 0-17)
+**Phase 2 — QAT Fine-tuning (v8 — current best, multi-GPU):**
+- **Quantizer:** SVIDBitLinear with LayerNorm inside every layer (OneBit full architecture):
+  `x_scaled = x * beta → signs = TanhSTE(w) → output = linear(x_scaled, signs) * alpha → LayerNorm(output)`
+- **LayerNorm:** `nn.LayerNorm(out_features, elementwise_affine=False)` — THE critical fix
+- **STE:** Tanh-STE: `grad * (1.001 - tanh(w)²)` — smooth gate, not vanilla pass-through
+- **Init:** weight = sign(W) * 0.01 (max gradient flow), alpha/beta from NMF on |W|
+- **Loss:** `--simple-loss` — KD logit loss (0.01 weight) + per-layer directional alignment (1.0 weight)
+  - All-layer L2-normalized MSE is DOMINANT (from OneBit's kd.py)
+  - KD logit loss scaled down 100x
+- **On-policy:** 15% of steps, temp=0.8 from 32-token prefix
+- **Data:** 30k examples × 50 epochs
+- **LR:** 1e-4 (20x higher than v7), beta2=0.98 (responsive to sign flips)
+- **Teacher:** Frozen 4-bit NF4 on GPU 0
 - **Student:** Split across both GPUs via accelerate.dispatch_model()
-- **Skipped layers:** Embedding + LM head kept in FP16
-- **Optimizer:** 8-bit AdamW, 10x LR for SVID alpha/beta vectors
+- **Optimizer:** 8-bit AdamW, 10x LR for SVID alpha/beta
 
 ### GPU Requirements
 
@@ -330,19 +355,19 @@ True binary only — NEVER ternary {-1,0,+1}.
 5. If no: launch without those flags (runs ~15 min GPTQ Phase 1 first)
 6. Monitor: `tail -f run_v5.3.log`
 
-**Current best launch command (v7 — OneBit recipe):**
+**Current best launch command (v8 — full OneBit architecture):**
 ```bash
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
     --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
-    --max-examples 30000 --epochs 50 \
+    --max-examples 30000 --epochs 50 --lr 1e-4 \
     --gen-check-interval 200 --eval-interval 1000 \
-    --output-dir quantize/runs/v7-qwen3-8b \
+    --output-dir quantize/runs/v8-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 \
     --unlikelihood-weight 0 \
-    2>&1 | tee run_v7.log
+    2>&1 | tee run_v8.log
 ```
 
 **GPU layout (v5.3):**
@@ -366,10 +391,15 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 - v5.2: killed before results — replaced by v5.3 with split student
 - v5.3: unlikelihood too weak (0.1), STE clip too aggressive (1.0), on-policy too slow to ramp
 - v5.4: same trajectory as v5.3 despite stronger hyperparameters — problem is structural not tuning
-- v6 SVID+500k: loss dropped to 2.24 but gen "Okayimport" attractor, 0/8. 5-term loss is the problem.
+- v6 SVID+500k: loss 2.24 but gen "Okayimport" 0/8 — 5-term loss + no LayerNorm
+- v7 SVID+simple loss: still 0/8 — missing LayerNorm inside BitLinear (THE primary bug)
 - 5-term loss (MSE+cos+CE+h_MSE+UL) → conflicting gradients → degenerate generation modes
-- 500k examples seen once < 30k examples seen 5+ times (repetition matters for 1-bit)
-- ProgressiveQuantizedLinear on 8B → OOM. Use BitLinear/SVIDBitLinear only.
+- LR 5e-6 was 80x too low (OneBit uses 4e-4) — sign landscape frozen from initialization
+- Vanilla/clipped STE → poor gradient quality. Use tanh-STE.
+- Weight init at full FP16 magnitude → 42% gradient at start. Use sign(W)*0.01 → 100%.
+- RMS init for alpha/beta → loses covariance structure. Use NMF.
+- Last-layer-only hidden MSE → layers 1-35 unconstrained. Use all-layer alignment.
+- ProgressiveQuantizedLinear on 8B → OOM. Use SVIDBitLinear only.
 - KL divergence → explodes to 3600+. Use normalized MSE + cosine instead.
 - Student on single GPU + on-policy → OOM at 84 GB. Must split student across both GPUs.
 - 35k examples is 400x too little data. Scale data if current approach fails.
