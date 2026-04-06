@@ -853,6 +853,8 @@ def main():
                         help="Max tokens generated in on-policy rollouts")
     parser.add_argument("--ste-clip", type=float, default=1.0,
                         help="STE clipping threshold (Change 3, 0 to disable)")
+    parser.add_argument("--qa-ratio", type=float, default=0.13,
+                        help="Target QA data ratio (0.13=13%% default, 0.8=80%% for factual focus)")
     parser.add_argument("--use-svid", action="store_true",
                         help="Use OneBit SVID decomposition instead of per-group scales")
     parser.add_argument("--simple-loss", action="store_true",
@@ -1001,7 +1003,7 @@ def main():
     # ── Data ──
     print("\n[5/5] Data...")
     print("  Loading QA data...")
-    qa_data = load_qa_data(tok, hw["max_seq_len"], max_examples=6000)
+    qa_data = load_qa_data(tok, hw["max_seq_len"], max_examples=10000)
     print("  Loading chat data...")
     raw = load_dataset(args.dataset, split="train")
     chat_data = []
@@ -1011,6 +1013,15 @@ def main():
             chat_data.append(t)
         if len(chat_data) >= args.max_examples:
             break
+
+    # Adjust mix to target QA ratio by repeating QA data
+    if args.qa_ratio > 0 and qa_data:
+        target_qa = int(len(chat_data) * args.qa_ratio / (1 - args.qa_ratio))
+        if target_qa > len(qa_data):
+            repeats = (target_qa // len(qa_data)) + 1
+            qa_data = (qa_data * repeats)[:target_qa]
+            print(f"  QA repeated {repeats}x to reach {args.qa_ratio*100:.0f}% ratio")
+
     print(f"  Chat: {len(chat_data)} | QA: {len(qa_data)}")
     data = chat_data + qa_data
     random.seed(args.seed)
