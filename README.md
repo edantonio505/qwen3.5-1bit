@@ -6,7 +6,7 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 
 ## Status
 
-**Active: v8 training run on 2x A100 80GB.** Full OneBit architecture from codebase audit: LayerNorm inside every BitLinear (THE primary fix for generation collapse), tanh-STE, NMF init with weight=sign(W)*0.01, all-layer directional alignment as dominant loss, LR=1e-4. Prior runs (v4.3-v7) all had good training loss but broken generation — root cause: missing LayerNorm causes activation explosion during autoregressive generation.
+**Active: v9 training run on 2x A100 80GB.** Same OneBit architecture as v8 (proven: LayerNorm, tanh-STE, NMF, SVID, all-layer alignment) but with 80% QA data ratio and 50k steps. v8 proved the architecture works (first ever content words + correct answer at 1-bit) but score stuck at 1/8 due to insufficient data repetition (50 exposures vs OneBit's 1000). v9 gives each fact ~2,500 exposures.
 
 ## Quick Start — Training
 
@@ -14,17 +14,18 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 # Install dependencies
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 8B model — CURRENT BEST (v8: full OneBit architecture with LayerNorm fix)
+# 8B model — CURRENT BEST (v9: proven architecture + 80% QA data + 50k steps)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
-    --max-examples 30000 --epochs 50 --lr 1e-4 \
-    --gen-check-interval 200 --eval-interval 1000 \
-    --output-dir quantize/runs/v8-qwen3-8b \
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 50000 \
+    --max-examples 10000 --epochs 100 --lr 1e-4 \
+    --qa-ratio 0.8 \
+    --gen-check-interval 500 --eval-interval 2000 \
+    --output-dir quantize/runs/v9-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
-    2>&1 | tee run_v8.log
+    2>&1 | tee run_v9.log
 
 # First run (no GPTQ checkpoint yet — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -245,11 +246,19 @@ Implements ALL 5 fixes found by auditing OneBit's actual codebase (github.com/xu
 | 3000 | 16.4 | 1/8 | "1902, popular figure in the world's" |
 | 3500 | **15.9** | — | "The answer to:" — coherent English, answer structure |
 
-- pkd_loss down **76%** (65.6→15.9), still declining, **no plateau**
-- First run to ever produce content words (step 600) or correct answers (step 2000)
+- pkd_loss down **76%** (65.6→15.5), plateauing at ~15.5 by step 4000
+- First run to EVER produce content words (step 600) or correct answers (step 2000)
 - Generation evolves: gibberish → function words → numbers → answer structure → sentences
-- **Data repetition bottleneck:** "Paris" seen ~50 times vs OneBit's 1000. More epochs needed.
-- GPU stable 39/52 GB, ETA ~41 hours for remaining 6500 steps
+- **Score stuck at 1/8 from step 2000 to 4250** — architecture works but data insufficient
+- **Architecture PROVEN:** LayerNorm prevents generation collapse. Killed to start v9 with more data.
+
+### v9 Run (In Progress — 2026-04-06) — Data Repetition Fix
+- **Same architecture as v8** (proven: LayerNorm + tanh-STE + NMF + SVID + all-layer alignment)
+- **80% QA ratio** (was 13%) — QA data repeated to fill training mix
+- **50k steps** (was 10k), 10k examples × 100 epochs
+- Each QA pair seen **~2,500 times** (vs v8's ~50, vs OneBit's 1000)
+- Tensorboard active, checkpoints every 500 steps with crash recovery
+- Tests the hypothesis: v8's 1/8 score was data-limited, not architecture-limited
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.

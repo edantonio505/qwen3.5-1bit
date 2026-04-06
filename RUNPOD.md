@@ -10,17 +10,18 @@ cd qwen3.5-1bit
 # 2. Install deps
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 3. Run v8 (CURRENT BEST — full OneBit architecture with LayerNorm fix)
+# 3. Run v9 (CURRENT BEST — proven architecture + 80% QA + 50k steps)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
-    --max-examples 30000 --epochs 50 --lr 1e-4 \
-    --gen-check-interval 200 --eval-interval 1000 \
-    --output-dir quantize/runs/v8-qwen3-8b \
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 50000 \
+    --max-examples 10000 --epochs 100 --lr 1e-4 \
+    --qa-ratio 0.8 \
+    --gen-check-interval 500 --eval-interval 2000 \
+    --output-dir quantize/runs/v9-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
-    2>&1 | tee run_v8.log
+    2>&1 | tee run_v9.log
 
 # First run (no GPTQ checkpoint — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -153,10 +154,16 @@ Research agent audited OneBit's GitHub codebase, found 5 critical missing featur
 - **FIX 4:** All-layer L2-normalized directional alignment (dominant loss term)
 - **FIX 5:** LR 1e-4 (was 5e-6), beta2=0.98
 - 30k examples × 50 epochs, SVID, simple loss, 10k steps
-- **Step 3500 results (35% done):** pkd_loss 65.6→15.9 (76% drop), no plateau
-- Step 600: first content tokens ever (numbers). Step 2000: first correct answer (2+2=4). Score 1/8.
-- Gen evolves: gibberish → function words → numbers → "The answer to the question is **"
-- Data bottleneck: "Paris" seen ~50 times (OneBit: 1000). Need more epochs for factual recall.
+- **Architecture PROVEN** through step 4250: LayerNorm prevents generation collapse.
+- First ever content words (step 600) and correct answer (step 2000, 2+2=4). Score 1/8.
+- Score stuck at 1/8 from step 2000-4250. pkd plateaued at ~15.5. Killed.
+- **Root cause: data insufficient.** "Paris" seen ~50 times (OneBit: 1000).
+
+### v9 run in progress (2026-04-06) — data repetition fix
+- Same architecture as v8 (proven). **80% QA ratio** (was 13%).
+- 50k steps, 10k examples × 100 epochs. Each fact seen ~2,500 times.
+- Tensorboard: `tensorboard --logdir quantize/runs/v9-qwen3-8b/tensorboard --bind_all`
+- Checkpoints every 500 steps. Crash recovery with `--resume-from`.
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically

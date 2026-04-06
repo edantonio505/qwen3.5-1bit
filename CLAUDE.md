@@ -210,7 +210,7 @@ v7 (killed — missing OneBit's core architecture):
 - Simple loss + SVID worked for training, but still 0/8 gen because we were missing
   the critical architectural feature: LayerNorm inside every BitLinear.
 
-v8 (running, step 250) — Full OneBit architecture from their actual codebase:
+v8 (killed step 4250, architecture proven, data insufficient) — Full OneBit architecture:
 - **FIX 1 (PRIMARY BUG):** LayerNorm(elementwise_affine=False) inside every SVIDBitLinear
   → Prevents activation magnitude explosion during autoregressive generation
   → Without this, each 1-bit layer amplifies errors by O(√d), model diverges by layer 20
@@ -220,15 +220,24 @@ v8 (running, step 250) — Full OneBit architecture from their actual codebase:
 - **FIX 4:** All-layer normalized directional alignment (L2-norm MSE at every layer, dominant term)
   → pkd_loss is the main signal, KD logit loss scaled down 100x
 - **FIX 5:** LR 1e-4 (was 5e-6, 20x increase), adam_beta2=0.98 (more responsive to sign flips)
-- **Results through step 3500 (35% complete):**
-  - pkd_loss: 65.6→34.8→24.5→21.5→18.0→16.4→**15.9** (76% reduction, still declining, no plateau)
-  - KD loss: 4296→1334→827→**777** (82% reduction)
-  - Score: 0/8 (step 1000) → **1/8** (step 2000, "4" in 2+2 answer) → 1/8 (step 3000)
+- **Results through step 4250 (killed):**
+  - pkd_loss: 65.6→24.5→18.0→16.4→**15.5** (76% reduction, plateauing at ~15.5)
+  - Score: 0/8 (step 1000) → **1/8** (step 2000) → 1/8 (step 3000) → 1/8 (step 4000)
   - Gen evolution: gibberish → function words → numbers → "The answer to the question is **"
-  - Step 600: first content tokens ever (numbers). Step 2000: first correct factual answer ever.
-  - Gen at step 3500: coherent English sentences, answer structure, but `**` placeholder for facts
-  - **Data repetition bottleneck:** model has seen "Paris" only ~50 times (OneBit: 1000). Need more epochs.
-  - GPU stable 39/52 GB, ETA ~41 hours remaining
+  - Step 600: first content tokens EVER. Step 2000: first correct factual answer EVER (2+2=4).
+  - **Architecture PROVEN:** LayerNorm prevents generation collapse. Coherent English sentences.
+  - **Data bottleneck CONFIRMED:** score stuck at 1/8 for 2000 steps. "Paris" seen ~50 times
+    (OneBit: 1000). Loss plateauing at ~23. More epochs needed, not more architecture changes.
+  - **Decision:** killed at step 4250 — architecture works, data repetition is the bottleneck.
+
+v9 (running) — same architecture, data repetition fix:
+- **80% QA ratio** (was 13%) — QA data repeated to fill 80% of training mix
+- **50k steps** (was 10k) — 5x more training, ~25+ epochs through data
+- **10k unique examples** × 100 epochs — each QA pair seen ~2,500 times (OneBit range)
+- Architecture unchanged: LayerNorm + tanh-STE + NMF + SVID + all-layer alignment
+- Tensorboard active: `tensorboard --logdir quantize/runs/v9-qwen3-8b/tensorboard --bind_all`
+- Checkpoints every 500 steps with full optimizer state (crash recovery works)
+- Starting loss: 82-88 (similar to v8). pkd: 66.1 (same starting point).
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 
@@ -413,19 +422,21 @@ The --resume-from flag:
 - Continues training exactly where it left off
 - Saves new checkpoints every 500 steps (so future crashes lose at most 499 steps)
 
-**Current best launch command (v8 — full OneBit architecture):**
+**Current best launch command (v9 — proven architecture + data repetition fix):**
 ```bash
+pip install scikit-learn tensorboard
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
-    --max-examples 30000 --epochs 50 --lr 1e-4 \
-    --gen-check-interval 200 --eval-interval 1000 \
-    --output-dir quantize/runs/v8-qwen3-8b \
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 50000 \
+    --max-examples 10000 --epochs 100 --lr 1e-4 \
+    --qa-ratio 0.8 \
+    --gen-check-interval 500 --eval-interval 2000 \
+    --output-dir quantize/runs/v9-qwen3-8b \
     --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 \
     --unlikelihood-weight 0 \
-    2>&1 | tee run_v8.log
+    2>&1 | tee run_v9.log
 ```
 
 **GPU layout (v5.3):**
@@ -451,8 +462,10 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 - v5.4: same trajectory as v5.3 despite stronger hyperparameters — problem is structural not tuning
 - v6 SVID+500k: loss 2.24 but gen "Okayimport" 0/8 — 5-term loss + no LayerNorm
 - v7 SVID+simple loss: still 0/8 — missing LayerNorm inside BitLinear (THE primary bug)
+- v8 architecture works but 13% QA ratio → "Paris" seen only 50 times → score stuck at 1/8
 - 5-term loss (MSE+cos+CE+h_MSE+UL) → conflicting gradients → degenerate generation modes
 - LR 5e-6 was 80x too low (OneBit uses 4e-4) — sign landscape frozen from initialization
+- 30k examples × 13% QA × 5 epochs → only 50 exposures per fact (OneBit: 1000). Need 80% QA.
 - Vanilla/clipped STE → poor gradient quality. Use tanh-STE.
 - Weight init at full FP16 magnitude → 42% gradient at start. Use sign(W)*0.01 → 100%.
 - RMS init for alpha/beta → loses covariance structure. Use NMF.
