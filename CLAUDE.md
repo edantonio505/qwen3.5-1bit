@@ -220,9 +220,15 @@ v8 (running, step 250) — Full OneBit architecture from their actual codebase:
 - **FIX 4:** All-layer normalized directional alignment (L2-norm MSE at every layer, dominant term)
   → pkd_loss is the main signal, KD logit loss scaled down 100x
 - **FIX 5:** LR 1e-4 (was 5e-6, 20x increase), adam_beta2=0.98 (more responsive to sign flips)
-- **Early results (step 250):** pkd_loss dropped 65.6→34.8 (47% reduction in all-layer directional error)
-  KD loss halved 4296→2220. Still in warmup (LR at 5e-5, target 1e-4).
-  Gen at step 200: function words (`, the to a and 0 in for`). Waiting for step 400+ gen check.
+- **Results through step 3500 (35% complete):**
+  - pkd_loss: 65.6→34.8→24.5→21.5→18.0→16.4→**15.9** (76% reduction, still declining, no plateau)
+  - KD loss: 4296→1334→827→**777** (82% reduction)
+  - Score: 0/8 (step 1000) → **1/8** (step 2000, "4" in 2+2 answer) → 1/8 (step 3000)
+  - Gen evolution: gibberish → function words → numbers → "The answer to the question is **"
+  - Step 600: first content tokens ever (numbers). Step 2000: first correct factual answer ever.
+  - Gen at step 3500: coherent English sentences, answer structure, but `**` placeholder for facts
+  - **Data repetition bottleneck:** model has seen "Paris" only ~50 times (OneBit: 1000). Need more epochs.
+  - GPU stable 39/52 GB, ETA ~41 hours remaining
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 
