@@ -389,6 +389,24 @@ periodic checkpoints.** Only the "best" checkpoint at step 2000 (1/8 eval) exist
 resume from that checkpoint — you lose steps 2000-current but not everything.
 Next launch will save checkpoints every 500 steps with full optimizer state.
 
+**For any future run (v9, v10, etc.) — general resume pattern:**
+```bash
+# 1. Find latest checkpoint:
+ls quantize/runs/<RUN_DIR>/checkpoint-*/training_state.pt | sort -t- -k2 -n | tail -1
+
+# 2. Resume with SAME args as original launch + --resume-from:
+python3 quantize/run_v5.py \
+  [... all original args ...] \
+  --resume-from quantize/runs/<RUN_DIR>/checkpoint-XXXX \
+  2>&1 | tee run_resumed.log
+```
+The --resume-from flag:
+- Loads model weights (including SVID alpha/beta/layernorm) into the SVIDBitLinear model
+- Restores optimizer state + scheduler state + step counter
+- Fast-forwards the dataloader to the correct position
+- Continues training exactly where it left off
+- Saves new checkpoints every 500 steps (so future crashes lose at most 499 steps)
+
 **Current best launch command (v8 — full OneBit architecture):**
 ```bash
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
