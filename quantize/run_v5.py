@@ -33,6 +33,11 @@ import time
 from pathlib import Path
 
 import torch
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TENSORBOARD = True
+except ImportError:
+    HAS_TENSORBOARD = False
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -1050,6 +1055,15 @@ def main():
         print(f"    Loss:       MSE(0.4) + cos(0.2) + CE(0.4) + h_MSE(0.1) + UL({args.unlikelihood_weight})")
     print()
 
+    # ── Tensorboard ──
+    tb_writer = None
+    if HAS_TENSORBOARD:
+        tb_dir = Path(args.output_dir) / "tensorboard"
+        tb_dir.mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(str(tb_dir))
+        print(f"  Tensorboard: {tb_dir}")
+        print(f"  View: tensorboard --logdir {tb_dir} --bind_all")
+
     # ── Train ──
     best_score = baseline
     best_step = 0
@@ -1190,6 +1204,17 @@ def main():
                           f"h={log_hmse/log_n:.3f} ul={log_ul/log_n:.3f} | "
                           f"sr={sr:.2f} op={op_frac:.2f} GPU={alloc:.0f}/{peak:.0f}GB | "
                           f"lr={sched.get_last_lr()[0]:.1e} | ETA {eta/60:.1f}m")
+                    # Tensorboard logging
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("loss/total", log_loss/log_n, step)
+                        tb_writer.add_scalar("loss/kd", log_mse/log_n, step)
+                        tb_writer.add_scalar("loss/pkd", log_hmse/log_n, step)
+                        tb_writer.add_scalar("loss/cos", log_cos/log_n, step)
+                        tb_writer.add_scalar("loss/ce", log_ce/log_n, step)
+                        tb_writer.add_scalar("train/lr", sched.get_last_lr()[0], step)
+                        tb_writer.add_scalar("train/on_policy", op_frac, step)
+                        tb_writer.add_scalar("gpu/peak_gb", peak, step)
+
                     log_loss = log_mse = log_cos = log_ce = log_hmse = log_ul = log_n = 0
 
                 # Gen check
@@ -1228,6 +1253,8 @@ def main():
                     try:
                         torch.cuda.synchronize()
                         score = run_eval(student, tok, f"step {step}/{total_steps}")
+                        if tb_writer is not None:
+                            tb_writer.add_scalar("eval/score", score, step)
                         if score > best_score:
                             best_score = score
                             best_step = step
@@ -1273,6 +1300,8 @@ def main():
                     "best_score": best_score, "best_step": best_step,
                     "final": final, "steps": step, "train_min": train_min,
                     "model": args.model}, f, indent=2)
+    if tb_writer is not None:
+        tb_writer.close()
     print("  Done.")
 
 
