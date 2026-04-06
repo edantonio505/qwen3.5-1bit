@@ -825,6 +825,8 @@ def main():
     # Phase 1
     parser.add_argument("--skip-gptq", action="store_true", help="Skip GPTQ calibration")
     parser.add_argument("--gptq-checkpoint", type=str, default=None)
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Resume training from a checkpoint dir (must contain training_state.pt)")
     parser.add_argument("--gptq-nsamples", type=int, default=128)
     parser.add_argument("--gptq-seqlen", type=int, default=2048)
     # Phase 2
@@ -1064,16 +1066,55 @@ def main():
         print(f"  Tensorboard: {tb_dir}")
         print(f"  View: tensorboard --logdir {tb_dir} --bind_all")
 
+    # ── Resume from checkpoint ──
+    start_step = 0
+    if args.resume_from is not None:
+        resume_dir = Path(args.resume_from)
+        if (resume_dir / "model.pt").exists():
+            print(f"\n  Resuming from {resume_dir}...")
+            state = torch.load(resume_dir / "model.pt", map_location="cpu")
+            student.load_state_dict(state, strict=False)
+            del state
+            if (resume_dir / "training_state.pt").exists():
+                ts = torch.load(resume_dir / "training_state.pt", map_location="cpu")
+                start_step = ts["step"]
+                best_score = ts.get("best_score", baseline)
+                best_step = ts.get("best_step", 0)
+                try:
+                    opt.load_state_dict(ts["optimizer"])
+                    sched.load_state_dict(ts["scheduler"])
+                except Exception as e:
+                    print(f"  Warning: could not load optimizer/scheduler: {e}")
+                print(f"  Resumed at step {start_step}, best={best_score:.0f}%")
+                del ts
+            else:
+                print(f"  Loaded model weights (no optimizer state)")
+            gc.collect()
+            torch.cuda.empty_cache()
+        else:
+            print(f"  WARNING: {resume_dir / 'model.pt'} not found, starting fresh")
+
     # ── Train ──
-    best_score = baseline
-    best_step = 0
-    step = 0
+    best_score = best_score if args.resume_from else baseline
+    best_step = best_step if args.resume_from else 0
+    step = start_step
     oom_count = 0
     t0 = time.time()
     log_loss = log_mse = log_cos = log_ce = log_hmse = log_ul = log_n = 0
 
+    # Track micro-batches for resume (skip to correct position in data)
+    micro_batch_idx = 0
+
     for epoch in range(args.epochs):
         for bi, batch in enumerate(loader):
+            # Skip batches if resuming (fast-forward to where we left off)
+            micro_batch_idx += 1
+            effective_step = micro_batch_idx // hw["grad_accum"]
+            if effective_step < start_step:
+                if micro_batch_idx % (hw["grad_accum"] * 100) == 0:
+                    print(f"  Fast-forwarding... step {effective_step}/{start_step}", end="\r")
+                continue
+
             sr = get_sampling_ratio(step, total_steps)
             op_frac = get_on_policy_fraction(step, total_steps, args.on_policy_fraction)
             use_on_policy = (op_frac > 0 and random.random() < op_frac)
@@ -1240,11 +1281,20 @@ def main():
                     try:
                         ckpt_dir = Path(args.output_dir) / f"checkpoint-{step}"
                         ckpt_dir.mkdir(parents=True, exist_ok=True)
+                        # Save model state (includes SVID alpha/beta/layernorm)
                         cpu_state = {k: v.cpu() for k, v in student.state_dict().items()}
                         torch.save(cpu_state, ckpt_dir / "model.pt")
                         del cpu_state
+                        # Save optimizer + scheduler + step for proper resume
+                        torch.save({
+                            "step": step,
+                            "optimizer": opt.state_dict(),
+                            "scheduler": sched.state_dict(),
+                            "best_score": best_score,
+                            "best_step": best_step,
+                        }, ckpt_dir / "training_state.pt")
                         tok.save_pretrained(ckpt_dir)
-                        print(f"  Checkpoint saved: {ckpt_dir}")
+                        print(f"  Checkpoint saved: {ckpt_dir} (model + optimizer + step {step})")
                     except Exception as e:
                         print(f"  Checkpoint save failed: {e}")
 
