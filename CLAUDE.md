@@ -345,13 +345,49 @@ each GPU only holds half the student's activations during forward pass.
 **Goal:** Quantize Qwen3-8B to true 1-bit ({-1,+1}). Target: PrismML Bonsai's 70.5% avg benchmark.
 True binary only — NEVER ternary {-1,0,+1}.
 
-**When resuming on a new server:**
+**When resuming on a new server or after a crash:**
 1. Check GPU setup: `nvidia-smi` — need 2x 80GB+ GPUs
 2. Check deps: `python3 -c "import torch, transformers, bitsandbytes, accelerate; print('OK')"`
-3. Check if GPTQ checkpoint exists: `ls quantize/runs/v5-qwen3-8b/gptq_checkpoint/group_scales.pt`
-4. If yes: launch with `--skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint`
-5. If no: launch without those flags (runs ~15 min GPTQ Phase 1 first)
-6. Monitor: `tail -f run_v8.log`
+3. Install extras: `pip install scikit-learn tensorboard`
+4. Check what checkpoints exist:
+   ```bash
+   ls quantize/runs/v8-qwen3-8b/checkpoint-*/training_state.pt 2>/dev/null  # periodic checkpoints
+   ls quantize/runs/v8-qwen3-8b/best/model.safetensors 2>/dev/null          # best eval checkpoint
+   ls quantize/runs/v5-qwen3-8b/gptq_checkpoint/group_scales.pt 2>/dev/null  # GPTQ init
+   ```
+
+5. **If periodic checkpoint exists (checkpoint-XXXX/training_state.pt):**
+   Resume from exact step with optimizer state:
+   ```bash
+   PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+     python3 quantize/run_v5.py \
+       --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 10000 \
+       --max-examples 30000 --epochs 50 --lr 1e-4 \
+       --gen-check-interval 200 --eval-interval 1000 \
+       --output-dir quantize/runs/v8-qwen3-8b \
+       --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
+       --use-svid --simple-loss \
+       --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
+       --resume-from quantize/runs/v8-qwen3-8b/checkpoint-XXXX \
+       2>&1 | tee run_v8_resumed.log
+   ```
+
+6. **If only "best" checkpoint exists (no training_state.pt):**
+   Resume from best eval checkpoint (loses optimizer state, restarts from that step):
+   ```bash
+   # Same command as above but: --resume-from quantize/runs/v8-qwen3-8b/best
+   ```
+   Note: "best" was saved via save_pretrained() and DOES contain SVID alpha/beta/layernorm
+   keys (verified: 576 keys). The --resume-from code loads them correctly into SVIDBitLinear.
+
+7. **If no checkpoint exists:** Start fresh with the v8 launch command above.
+8. Monitor: `tail -f run_v8.log` or `run_v8_resumed.log`
+9. Tensorboard: `tensorboard --logdir quantize/runs/v8-qwen3-8b/tensorboard --bind_all`
+
+**IMPORTANT: Current v8 run (process loaded before checkpoint code was added) does NOT save
+periodic checkpoints.** Only the "best" checkpoint at step 2000 (1/8 eval) exists. If it crashes,
+resume from that checkpoint — you lose steps 2000-current but not everything.
+Next launch will save checkpoints every 500 steps with full optimizer state.
 
 **Current best launch command (v8 — full OneBit architecture):**
 ```bash
