@@ -4,7 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## ⚡ CURRENT STATE — READ THIS FIRST (2026-04-07)
 
-**Active run: v10 on Qwen3.5-2B** (PROOF OF CONCEPT). Check `run_v10.log`.
+**Active run: v10 on Qwen3-1.7B** (PROOF OF CONCEPT, dense twin of 8B). Check `run_v10.log`.
+
+> ⚠️ **MODEL CHOICE RULE — read before changing `--model`:**
+> Only use **dense Qwen3** models: `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen3-4B`, `Qwen3-8B`.
+> NEVER use anything from the **Qwen3.5** family. Qwen3.5 is a multimodal hybrid
+> (`Qwen3_5ForConditionalGeneration`, vision tower, MTP head, 18/24 layers are
+> Mamba-style `linear_attention`). Our 1-bit recipe is built for dense `nn.Linear`
+> stacks and does NOT transfer to linear-attention/SSM/MoE/multimodal layers.
+> Verify before launch: model config must have `model_type: qwen3` (not `qwen3_5`)
+> and `architectures: ["Qwen3ForCausalLM"]`. The `flash-linear-attention` /
+> `causal-conv1d` warning at load time is a giveaway you're on a hybrid model — abort.
 
 **The story so far across 10 runs:**
 1. v4.3-v7: Various failed attempts on 8B (wrong loss, wrong init, missing LayerNorm, etc.)
@@ -13,19 +23,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    and first correct factual answer (step 2000, 2+2=4). Score reached 1/8 then plateaued.
 3. v9: Tried 80% QA ratio + 50k steps on 8B to fix data bottleneck. Killed at step 400 because
    it plateaued at the SAME pkd level as v8 (~26), suggesting more data alone won't break through.
-4. **v10 (running)**: Pivoted to Qwen3.5-2B with the proven v8 architecture. Same recipe, smaller
-   model. ~10x faster training. The scientific question: does the architecture work AT ALL on
-   any model? If 2B reaches 4/8+, the architecture is right and 8B needs more compute. If 2B
-   also caps at 1/8, we have a fundamental architecture limit.
+4. **v10 first attempt (ABORTED)**: Launched on Qwen3.5-2B before checking architecture. It's a
+   multimodal vision-LM hybrid with linear-attention layers — wrong architecture for our recipe.
+   Killed before significant compute was wasted. Aborted dir:
+   `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/`.
+5. **v10 (running)**: Relaunched on **Qwen3-1.7B** — true dense twin of Qwen3-8B (same family,
+   `Qwen3ForCausalLM`, full attention every layer, vocab 151936). Same v8 architecture, same v9
+   data strategy (80% QA, 50k steps, 100 epochs × 10k examples). ~5x smaller than 8B → ~5x
+   faster training. The scientific question: does the architecture work AT ALL on a smaller dense
+   model? If 1.7B reaches 4/8+, the architecture is right and 8B needs more compute. If 1.7B
+   also caps at 1/8, we have a fundamental architecture limit and need to pivot
+   (likely to teacher-generated synthetic data, OneBit's actual approach).
 
 **What to do next when v10 finishes (or if it crashes):**
 - Check `tail -30 run_v10.log` for current step + score
-- If score ≥ 4/8 on 2B → architecture is proven, return to 8B with more compute (more days)
+- If score ≥ 4/8 on 1.7B → architecture is proven, return to 8B with more compute (more days)
 - If score plateaus at 1-2/8 → architecture has fundamental limit, try alternative approaches:
   - **Best alternative: Synthetic data from teacher** (OneBit's actual approach we never tried)
   - Generate 30k+ teacher responses to diverse prompts, train student on those exact outputs
   - This guarantees student sees teacher's exact distribution, not human-written text
-- If 2B crashes: resume with `--resume-from quantize/runs/v10-qwen3.5-2b/checkpoint-XXXX`
+- If 1.7B crashes: resume with `--resume-from quantize/runs/v10-qwen3-1.7b/checkpoint-XXXX`
   (checkpoints save every 500 steps with full optimizer state)
 
 **Key files to know:**
@@ -33,11 +50,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `quantize/gptq_1bit.py` — GPTQ Phase 1 calibration
 - `quantize/diagnose.py` — Logit ranking diagnostic (run on saved checkpoint)
 - `run_v10.log` — Current run output
-- `quantize/runs/v10-qwen3.5-2b/` — Current run output dir
+- `quantize/runs/v10-qwen3-1.7b/` — Current run output dir
+- `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/` — Aborted first v10 attempt (wrong arch)
 - `quantize/runs/v5-qwen3-8b/gptq_checkpoint/` — Reusable 8B GPTQ checkpoint (if returning to 8B)
 - `quantize/runs/v8-qwen3-8b/best/` — v8's best checkpoint (1/8, 576 SVID keys verified)
 
-**Hardware:** 2x A100 80GB. For 2B you could downsize to 1x A40 48GB (~80% cost savings).
+**Hardware:** Currently 1x A40 48GB (sufficient for 1.7B). For 8B return-trip you need 2x A100 80GB.
 
 **Critical knowledge to preserve (architecture is SETTLED, do not change):**
 1. SVIDBitLinear with `nn.LayerNorm(out, elementwise_affine=False)` after binary matmul
@@ -286,18 +304,30 @@ v9 (killed step 400 — early plateau on 8B with same data) — 80% QA, 50k step
 - Step 50: pkd 66.0 | Step 200: pkd 46.2 | Step 250: pkd 31.5 | Step 400: pkd 26.4
 - Faster initial drop than v8 (3x faster to pkd~26) but plateaued at SAME level as v8 (~26)
 - Decision: 8B might need fundamentally different approach OR more compute than feasible
-- Pivoted to 2B as proof of concept
+- Pivoted to a smaller dense model (Qwen3-1.7B) as proof of concept
 
-v10 (running) — Qwen3.5-2B with proven v8 architecture (PROOF OF CONCEPT):
+v10 first attempt (ABORTED 2026-04-07, before training started) — Qwen/Qwen3.5-2B:
+- Launched without checking the model architecture. Killed during GPTQ Phase 1 (layer ~5/24).
+- **Why aborted:** Qwen3.5-2B is `Qwen3_5ForConditionalGeneration` — a multimodal vision-LM
+  hybrid with `vision_config`, `image_token_id`, MTP head, vocab 248320, and 18/24 text-tower
+  layers as `linear_attention` (Mamba-style: `linear_conv_kernel_dim`, `mamba_ssm_dtype`).
+  Only 6/24 layers are full attention. The `flash-linear-attention` / `causal-conv1d` warning
+  at load time was the giveaway. Our v8 recipe (LayerNorm-after-binary, all-layer directional
+  alignment) is built for dense `nn.Linear` stacks and does not transfer to SSM/linear-attention
+  layers where error compounds through recurrent state. Aborted dir:
+  `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/`. See MODEL CHOICE RULE at top of file.
+
+v10 (running) — Qwen3-1.7B (true dense twin of 8B) with proven v8 architecture (PROOF OF CONCEPT):
 - **Same architecture as v8**: LayerNorm + tanh-STE + NMF + SVID + all-layer alignment
 - **Same data strategy as v9**: 80% QA, 50k steps, 10k examples × 100 epochs
-- **Smaller model**: ~10x faster training. ~2 days for 50k steps vs ~9 days for 8B.
-- **Key question:** Does the v8 architecture work AT ALL on a smaller model?
-  - If 2B reaches 4/8+ → architecture is correct, 8B just needs more compute
-  - If 2B also plateaus at 1/8 → fundamental architecture limit, need different approach
-- **Hardware note:** 2B uses ~20 GB peak per GPU. Could downsize to 1x A40 48GB (~$0.40/hr)
-  vs current 2x A100 80GB (~$3/hr). 80% cost savings if continued long-term.
-- Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3.5-2b/tensorboard --bind_all`
+- **Same family as 8B**: `Qwen3ForCausalLM`, `model_type: qwen3`, 28 dense layers, hidden 2048,
+  full attention every layer, vocab 151936 (same tokenizer as Qwen3-8B)
+- **Smaller model**: ~5x faster training than 8B. Fits on a single A40 48GB.
+- **Key question:** Does the v8 architecture work AT ALL on a smaller dense model?
+  - If 1.7B reaches 4/8+ → architecture is correct, 8B just needs more compute
+  - If 1.7B also plateaus at 1/8 → fundamental architecture limit, need different approach
+- **Hardware note:** 1x A40 48GB (~$0.40/hr) instead of 2x A100 80GB (~$3/hr). ~85% cost savings.
+- Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3-1.7b/tensorboard --bind_all`
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 
@@ -404,7 +434,7 @@ quantize/
 
 | Model | Config | Total VRAM | Example GPU |
 |-------|--------|-----------|-------------|
-| Qwen3.5-2B | BF16 teacher + ProgressiveQuantized student | ~40 GB | A40 48GB |
+| Qwen3-1.7B | 4-bit teacher + SVIDBitLinear student (v10) | ~20-30 GB peak | 1x A40 48GB |
 | Qwen3-8B | 4-bit teacher + split student (v5.3) | ~50-60 GB peak/GPU | 2x A100 80GB |
 | Qwen3-8B | 4-bit teacher + student single GPU (v5.1, OOM) | ~84 GB peak | OOM on 80GB |
 | Qwen3.5-35B | 4-bit teacher + student | ~380 GB | 8x A100 80GB |
@@ -482,22 +512,24 @@ The --resume-from flag:
 - Continues training exactly where it left off
 - Saves new checkpoints every 500 steps (so future crashes lose at most 499 steps)
 
-**Current launch command (v10 — Qwen3.5-2B proof of concept):**
+**Current launch command (v10 — Qwen3-1.7B dense proof of concept):**
 ```bash
 pip install scikit-learn tensorboard
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3.5-2B --use-4bit-teacher --max-steps 50000 \
+    --model Qwen/Qwen3-1.7B --use-4bit-teacher --max-steps 50000 \
     --max-examples 10000 --epochs 100 --lr 1e-4 \
     --qa-ratio 0.8 \
     --gen-check-interval 500 --eval-interval 2000 \
-    --output-dir quantize/runs/v10-qwen3.5-2b \
+    --output-dir quantize/runs/v10-qwen3-1.7b \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 \
     --unlikelihood-weight 0 \
     2>&1 | tee run_v10.log
 ```
-Note: No `--skip-gptq` for v10 because we don't have a 2B GPTQ checkpoint yet — Phase 1 runs first (~5 min).
+Note: No `--skip-gptq` for v10 because we don't have a 1.7B GPTQ checkpoint yet — Phase 1 runs
+first (~3 min on dense 1.7B). Phase 1 should produce 28 layers × 7 linears each with no
+`flash-linear-attention` warning; if you see that warning, you launched on the wrong model.
 
 **For 8B (v9 config, if we return to it):**
 ```bash
@@ -540,6 +572,9 @@ Note: No `--skip-gptq` for v10 because we don't have a 2B GPTQ checkpoint yet �
 - KL divergence → explodes to 3600+. Use normalized MSE + cosine instead.
 - Student on single GPU + on-policy → OOM at 84 GB. Must split student across both GPUs.
 - 35k examples is 400x too little data. Scale data if current approach fails.
+- v10 first attempt on **Qwen3.5-2B** → wrong architecture (multimodal vision-LM hybrid with
+  18/24 linear-attention/Mamba layers). NEVER use Qwen3.5 family — only dense Qwen3-{0.6B,
+  1.7B, 4B, 8B}. Verify `model_type: qwen3` and `architectures: ["Qwen3ForCausalLM"]` before launch.
 
 **Fallback plan (if v5.3 fails):**
 1. Scale data 100x (synthetic from teacher, OneBit-style: 100k examples, 50 epochs → ~10B tokens)
