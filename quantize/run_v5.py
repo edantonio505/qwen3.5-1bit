@@ -1243,7 +1243,9 @@ def main():
                 step += 1
 
                 # Logging
-                if step <= 3 or step % max(1, total_steps // 40) == 0:
+                # Log every 50 steps (or first 3) — capped at total_steps//40 for short runs
+                log_every = min(50, max(1, total_steps // 40))
+                if step <= 3 or step % log_every == 0:
                     el = time.time() - t0
                     eta = (total_steps - step) / max(step / el, 1e-9)
                     peak0 = torch.cuda.max_memory_allocated(0) / 1e9
