@@ -10,18 +10,19 @@ cd qwen3.5-1bit
 # 2. Install deps
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 3. Run v9 (CURRENT BEST — proven architecture + 80% QA + 50k steps)
+# 3. Run v10 (CURRENT — Qwen3.5-2B proof of concept, ~10x faster than 8B)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 50000 \
+    --model Qwen/Qwen3.5-2B --use-4bit-teacher --max-steps 50000 \
     --max-examples 10000 --epochs 100 --lr 1e-4 \
     --qa-ratio 0.8 \
     --gen-check-interval 500 --eval-interval 2000 \
-    --output-dir quantize/runs/v9-qwen3-8b \
-    --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
+    --output-dir quantize/runs/v10-qwen3.5-2b \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
-    2>&1 | tee run_v9.log
+    2>&1 | tee run_v10.log
+
+# Hardware: 2B fits on 1x A40 48GB (~$0.40/hr) — 80% cost savings vs 2x A100
 
 # First run (no GPTQ checkpoint — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
@@ -159,11 +160,15 @@ Research agent audited OneBit's GitHub codebase, found 5 critical missing featur
 - Score stuck at 1/8 from step 2000-4250. pkd plateaued at ~15.5. Killed.
 - **Root cause: data insufficient.** "Paris" seen ~50 times (OneBit: 1000).
 
-### v9 run in progress (2026-04-06) — data repetition fix
-- Same architecture as v8 (proven). **80% QA ratio** (was 13%).
-- 50k steps, 10k examples × 100 epochs. Each fact seen ~2,500 times.
-- Tensorboard: `tensorboard --logdir quantize/runs/v9-qwen3-8b/tensorboard --bind_all`
-- Checkpoints every 500 steps. Crash recovery with `--resume-from`.
+### v9 (killed step 400) — same data plateau on 8B
+- Faster initial pkd drop (3x faster to pkd~26) but plateaued at SAME level as v8
+- More data alone doesn't break through. Either need more compute OR different approach.
+
+### v10 run in progress (2026-04-07) — 2B proof of concept
+- Same v8 architecture on Qwen3.5-2B (~10x faster training, ~2 days for 50k steps)
+- Tests if architecture works on smaller model before investing in more 8B compute
+- Hardware can be downsized to 1x A40 48GB (~$0.40/hr vs $3/hr current)
+- Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3.5-2b/tensorboard --bind_all`
 
 ### Architecture notes for Qwen3/Qwen3.5
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically

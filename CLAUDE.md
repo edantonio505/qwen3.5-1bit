@@ -2,6 +2,58 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚡ CURRENT STATE — READ THIS FIRST (2026-04-07)
+
+**Active run: v10 on Qwen3.5-2B** (PROOF OF CONCEPT). Check `run_v10.log`.
+
+**The story so far across 10 runs:**
+1. v4.3-v7: Various failed attempts on 8B (wrong loss, wrong init, missing LayerNorm, etc.)
+2. **v8 ARCHITECTURE BREAKTHROUGH**: Found the OneBit codebase fixes (LayerNorm inside BitLinear,
+   tanh-STE, NMF init, all-layer alignment, LR 1e-4). Got first ever content tokens (step 600)
+   and first correct factual answer (step 2000, 2+2=4). Score reached 1/8 then plateaued.
+3. v9: Tried 80% QA ratio + 50k steps on 8B to fix data bottleneck. Killed at step 400 because
+   it plateaued at the SAME pkd level as v8 (~26), suggesting more data alone won't break through.
+4. **v10 (running)**: Pivoted to Qwen3.5-2B with the proven v8 architecture. Same recipe, smaller
+   model. ~10x faster training. The scientific question: does the architecture work AT ALL on
+   any model? If 2B reaches 4/8+, the architecture is right and 8B needs more compute. If 2B
+   also caps at 1/8, we have a fundamental architecture limit.
+
+**What to do next when v10 finishes (or if it crashes):**
+- Check `tail -30 run_v10.log` for current step + score
+- If score ≥ 4/8 on 2B → architecture is proven, return to 8B with more compute (more days)
+- If score plateaus at 1-2/8 → architecture has fundamental limit, try alternative approaches:
+  - **Best alternative: Synthetic data from teacher** (OneBit's actual approach we never tried)
+  - Generate 30k+ teacher responses to diverse prompts, train student on those exact outputs
+  - This guarantees student sees teacher's exact distribution, not human-written text
+- If 2B crashes: resume with `--resume-from quantize/runs/v10-qwen3.5-2b/checkpoint-XXXX`
+  (checkpoints save every 500 steps with full optimizer state)
+
+**Key files to know:**
+- `quantize/run_v5.py` — Main training script (despite name, has v8 architecture inside)
+- `quantize/gptq_1bit.py` — GPTQ Phase 1 calibration
+- `quantize/diagnose.py` — Logit ranking diagnostic (run on saved checkpoint)
+- `run_v10.log` — Current run output
+- `quantize/runs/v10-qwen3.5-2b/` — Current run output dir
+- `quantize/runs/v5-qwen3-8b/gptq_checkpoint/` — Reusable 8B GPTQ checkpoint (if returning to 8B)
+- `quantize/runs/v8-qwen3-8b/best/` — v8's best checkpoint (1/8, 576 SVID keys verified)
+
+**Hardware:** 2x A100 80GB. For 2B you could downsize to 1x A40 48GB (~80% cost savings).
+
+**Critical knowledge to preserve (architecture is SETTLED, do not change):**
+1. SVIDBitLinear with `nn.LayerNorm(out, elementwise_affine=False)` after binary matmul
+2. TanhSTE: `grad * (1.001 - tanh(w)²)` instead of vanilla STE
+3. NMF init for alpha/beta + weight = `sign(W) * 0.01` (not `* 1.0`)
+4. All-layer L2-normalized directional alignment as DOMINANT loss (KD logit scaled 100x down)
+5. LR 1e-4, beta2=0.98, 8-bit AdamW
+6. Student split across 2 GPUs via `accelerate.dispatch_model()` (for 8B)
+7. 80% QA ratio via `--qa-ratio 0.8` (data fix, applied in v9/v10)
+8. Checkpoint every 500 steps with full optimizer state (--resume-from supported)
+9. Tensorboard logging built in (--logdir runs/<run>/tensorboard)
+10. NEVER use ternary {-1,0,+1} — must be true binary {-1,+1} like Bonsai
+
+---
+
+
 ## Project Overview
 
 This project has two parts:
@@ -230,14 +282,22 @@ v8 (killed step 4250, architecture proven, data insufficient) — Full OneBit ar
     (OneBit: 1000). Loss plateauing at ~23. More epochs needed, not more architecture changes.
   - **Decision:** killed at step 4250 — architecture works, data repetition is the bottleneck.
 
-v9 (running) — same architecture, data repetition fix:
-- **80% QA ratio** (was 13%) — QA data repeated to fill 80% of training mix
-- **50k steps** (was 10k) — 5x more training, ~25+ epochs through data
-- **10k unique examples** × 100 epochs — each QA pair seen ~2,500 times (OneBit range)
-- Architecture unchanged: LayerNorm + tanh-STE + NMF + SVID + all-layer alignment
-- Tensorboard active: `tensorboard --logdir quantize/runs/v9-qwen3-8b/tensorboard --bind_all`
-- Checkpoints every 500 steps with full optimizer state (crash recovery works)
-- Starting loss: 82-88 (similar to v8). pkd: 66.1 (same starting point).
+v9 (killed step 400 — early plateau on 8B with same data) — 80% QA, 50k steps:
+- Step 50: pkd 66.0 | Step 200: pkd 46.2 | Step 250: pkd 31.5 | Step 400: pkd 26.4
+- Faster initial drop than v8 (3x faster to pkd~26) but plateaued at SAME level as v8 (~26)
+- Decision: 8B might need fundamentally different approach OR more compute than feasible
+- Pivoted to 2B as proof of concept
+
+v10 (running) — Qwen3.5-2B with proven v8 architecture (PROOF OF CONCEPT):
+- **Same architecture as v8**: LayerNorm + tanh-STE + NMF + SVID + all-layer alignment
+- **Same data strategy as v9**: 80% QA, 50k steps, 10k examples × 100 epochs
+- **Smaller model**: ~10x faster training. ~2 days for 50k steps vs ~9 days for 8B.
+- **Key question:** Does the v8 architecture work AT ALL on a smaller model?
+  - If 2B reaches 4/8+ → architecture is correct, 8B just needs more compute
+  - If 2B also plateaus at 1/8 → fundamental architecture limit, need different approach
+- **Hardware note:** 2B uses ~20 GB peak per GPU. Could downsize to 1x A40 48GB (~$0.40/hr)
+  vs current 2x A100 80GB (~$3/hr). 80% cost savings if continued long-term.
+- Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3.5-2b/tensorboard --bind_all`
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 
@@ -422,21 +482,27 @@ The --resume-from flag:
 - Continues training exactly where it left off
 - Saves new checkpoints every 500 steps (so future crashes lose at most 499 steps)
 
-**Current best launch command (v9 — proven architecture + data repetition fix):**
+**Current launch command (v10 — Qwen3.5-2B proof of concept):**
 ```bash
 pip install scikit-learn tensorboard
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 50000 \
+    --model Qwen/Qwen3.5-2B --use-4bit-teacher --max-steps 50000 \
     --max-examples 10000 --epochs 100 --lr 1e-4 \
     --qa-ratio 0.8 \
     --gen-check-interval 500 --eval-interval 2000 \
-    --output-dir quantize/runs/v9-qwen3-8b \
-    --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
+    --output-dir quantize/runs/v10-qwen3.5-2b \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 \
     --unlikelihood-weight 0 \
-    2>&1 | tee run_v9.log
+    2>&1 | tee run_v10.log
+```
+Note: No `--skip-gptq` for v10 because we don't have a 2B GPTQ checkpoint yet — Phase 1 runs first (~5 min).
+
+**For 8B (v9 config, if we return to it):**
+```bash
+# Add: --model Qwen/Qwen3-8B --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
+# Change output-dir to quantize/runs/v9-qwen3-8b
 ```
 
 **GPU layout (v5.3):**

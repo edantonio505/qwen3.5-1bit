@@ -6,7 +6,7 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 
 ## Status
 
-**Active: v9 training run on 2x A100 80GB.** Same OneBit architecture as v8 (proven: LayerNorm, tanh-STE, NMF, SVID, all-layer alignment) but with 80% QA data ratio and 50k steps. v8 proved the architecture works (first ever content words + correct answer at 1-bit) but score stuck at 1/8 due to insufficient data repetition (50 exposures vs OneBit's 1000). v9 gives each fact ~2,500 exposures.
+**Active: v10 on Qwen3.5-2B (proof of concept).** v8 proved the OneBit architecture works on 8B (first ever content tokens + correct factual answer at 1-bit), but score plateaued at 1/8. v9 attempted data fix on 8B but plateaued at same level after 400 steps. Pivoted to v10 on smaller Qwen3.5-2B (~10x faster training) with same architecture. The question: does this approach scale down to a smaller model? If 2B reaches 4/8+, architecture is right and 8B just needs more compute. If 2B also caps at 1/8, the architecture has fundamental limits and we need a different approach (synthetic data from teacher).
 
 ## Quick Start — Training
 
@@ -14,18 +14,21 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 # Install dependencies
 pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
 
-# 8B model — CURRENT BEST (v9: proven architecture + 80% QA data + 50k steps)
+# 2B model — CURRENT (v10: proof of concept on smaller model)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 50000 \
+    --model Qwen/Qwen3.5-2B --use-4bit-teacher --max-steps 50000 \
     --max-examples 10000 --epochs 100 --lr 1e-4 \
     --qa-ratio 0.8 \
     --gen-check-interval 500 --eval-interval 2000 \
-    --output-dir quantize/runs/v9-qwen3-8b \
-    --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
+    --output-dir quantize/runs/v10-qwen3.5-2b \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
-    2>&1 | tee run_v9.log
+    2>&1 | tee run_v10.log
+
+# 8B model — same recipe (if returning to 8B):
+# Add --model Qwen/Qwen3-8B --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
+# Change output-dir to quantize/runs/v10-qwen3-8b (or similar)
 
 # First run (no GPTQ checkpoint yet — runs Phase 1 first, ~15 min):
 # Remove --skip-gptq and --gptq-checkpoint flags
