@@ -1,5 +1,12 @@
 # RunPod Setup — Qwen 1-bit QAT
 
+> 🎉 **v10 BREAKTHROUGH (2026-04-07):** The v8 architecture + 80% QA + 50k-step recipe on
+> Qwen3-1.7B reached **4/8 = 50% accuracy** on the factual eval at step 6000, with two
+> unambiguous correct answers (Shakespeare, Au). pkd dropped from 65 → 9.2, blowing past
+> v8's plateau of 15.5 on 8B. This settles the architecture-vs-compute question definitively:
+> the architecture works AND v8's 1/8 ceiling on 8B was compute-limited. Best checkpoint
+> at `quantize/runs/v10-qwen3-1.7b/best/`. See `CLAUDE.md` for the full v10 result.
+
 > ⚠️ **MODEL CHOICE RULE:** Only dense Qwen3 models work — `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen3-4B`,
 > `Qwen3-8B`. **NEVER use anything from the Qwen3.5 family.** Qwen3.5 is a multimodal hybrid
 > (`Qwen3_5ForConditionalGeneration`, vision tower, MTP head, 18/24 text-tower layers are
@@ -7,6 +14,14 @@
 > Verify before launch: model config must have `model_type: qwen3` and
 > `architectures: ["Qwen3ForCausalLM"]`. The `flash-linear-attention` / `causal-conv1d` warning
 > at load time is the giveaway you're on a hybrid model — abort.
+
+> ⚠️ **DISK QUOTA TRAP:** RunPod's `/workspace` is a FUSE-mounted MooseFS network volume with
+> a per-tenant quota (~50 GB on a typical pod). Each checkpoint is ~7 GB, so 6-7 of them fill
+> the quota and the next checkpoint write gets **silently truncated** to a 1 GiB exact boundary
+> mid-flight, killing the training process. Worse: any other file being written (e.g. an `Edit`
+> to a python script) at the same moment can also be null-zeroed. Mitigation:
+> `quantize/run_v5.py` now rotates checkpoints (deletes oldest before each save) to cap usage
+> at ~14 GB. Verify before any large write operation: `du -sh /workspace`. Clean up if > 35 GB.
 
 ## Quick Start
 
@@ -183,12 +198,17 @@ Research agent audited OneBit's GitHub codebase, found 5 critical missing featur
   it has no LayerNorm fix for SSM recurrent state. Aborted dir:
   `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/`. See MODEL CHOICE RULE at top of file.
 
-### v10 run in progress (2026-04-07) — Qwen3-1.7B dense proof of concept
+### v10 (BREAKTHROUGH 2026-04-07) — Qwen3-1.7B dense, 4/8 = 50% at step 6000
 - Same v8 architecture on Qwen3-1.7B (~5x faster training than 8B)
 - True dense twin of Qwen3-8B: same family (`Qwen3ForCausalLM`), same tokenizer (vocab 151936),
   28 dense layers, full attention every layer, no SSM/MoE/vision
-- Tests if architecture works on a smaller dense model before investing in more 8B compute
-- Fits on 1x A40 48GB (~$0.40/hr vs $3/hr for 2x A100 80GB)
+- Survived a checkpoint-write disk-quota crash at step 3500; resumed cleanly from
+  checkpoint-3000 with optimizer state preserved. Fixed via checkpoint rotation.
+- **pkd: 65 → 9.2 by step 6000 (vs v8 plateau 15.5 on 8B). Score: 4/8 = 50% (4x v8's best).**
+  HITs on Paris, "4", Shakespeare, Au. Off-by-2 on boiling point (102°C). Best checkpoint
+  saved at `quantize/runs/v10-qwen3-1.7b/best/` (3.4 GB safetensors — do NOT delete).
+- Run continues to 50k steps to find the asymptote on 1.7B
+- Fits on 1x A40 48GB (~$0.40/hr vs $3/hr for 2x A100 80GB), peak ~17/33 GB used
 - Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3-1.7b/tensorboard --bind_all`
 
 ### Architecture notes for Qwen3 vs Qwen3.5

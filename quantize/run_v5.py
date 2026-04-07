@@ -29,6 +29,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import time
 from pathlib import Path
 
@@ -1292,6 +1293,20 @@ def main():
                 # Periodic checkpoint every 500 steps (crash recovery)
                 if step % 500 == 0 and step > 0:
                     try:
+                        # Rotate: delete oldest checkpoint before saving new one
+                        # (prevents disk-quota crashes — checkpoints are ~7 GB each)
+                        existing = []
+                        for p in Path(args.output_dir).glob("checkpoint-*"):
+                            try:
+                                existing.append((int(p.name.split("-", 1)[1]), p))
+                            except (ValueError, IndexError):
+                                pass
+                        existing.sort(key=lambda t: t[0])
+                        if existing:
+                            oldest_step, oldest_path = existing[0]
+                            shutil.rmtree(oldest_path, ignore_errors=True)
+                            print(f"  Rotated: deleted checkpoint-{oldest_step}")
+
                         ckpt_dir = Path(args.output_dir) / f"checkpoint-{step}"
                         ckpt_dir.mkdir(parents=True, exist_ok=True)
                         # Save model state (includes SVID alpha/beta/layernorm)
