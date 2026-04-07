@@ -1,5 +1,13 @@
 # RunPod Setup — Qwen 1-bit QAT
 
+> ⚠️ **MODEL CHOICE RULE:** Only dense Qwen3 models work — `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen3-4B`,
+> `Qwen3-8B`. **NEVER use anything from the Qwen3.5 family.** Qwen3.5 is a multimodal hybrid
+> (`Qwen3_5ForConditionalGeneration`, vision tower, MTP head, 18/24 text-tower layers are
+> Mamba-style `linear_attention`). Our 1-bit recipe only handles dense `nn.Linear` stacks.
+> Verify before launch: model config must have `model_type: qwen3` and
+> `architectures: ["Qwen3ForCausalLM"]`. The `flash-linear-attention` / `causal-conv1d` warning
+> at load time is the giveaway you're on a hybrid model — abort.
+
 ## Quick Start
 
 ```bash
@@ -8,24 +16,27 @@ git clone https://github.com/edantonio505/qwen3.5-1bit.git
 cd qwen3.5-1bit
 
 # 2. Install deps
-pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
+pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf scikit-learn tensorboard
 
-# 3. Run v10 (CURRENT — Qwen3.5-2B proof of concept, ~10x faster than 8B)
+# 3. Run v10 (CURRENT — Qwen3-1.7B dense proof of concept, ~5x faster than 8B)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3.5-2B --use-4bit-teacher --max-steps 50000 \
+    --model Qwen/Qwen3-1.7B --use-4bit-teacher --max-steps 50000 \
     --max-examples 10000 --epochs 100 --lr 1e-4 \
     --qa-ratio 0.8 \
     --gen-check-interval 500 --eval-interval 2000 \
-    --output-dir quantize/runs/v10-qwen3.5-2b \
+    --output-dir quantize/runs/v10-qwen3-1.7b \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
     2>&1 | tee run_v10.log
 
-# Hardware: 2B fits on 1x A40 48GB (~$0.40/hr) — 80% cost savings vs 2x A100
+# Hardware: 1.7B dense fits on 1x A40 48GB (~$0.40/hr) — ~85% cost savings vs 2x A100 80GB
 
-# First run (no GPTQ checkpoint — runs Phase 1 first, ~15 min):
+# First run (no GPTQ checkpoint — runs Phase 1 first, ~3 min on dense 1.7B):
 # Remove --skip-gptq and --gptq-checkpoint flags
+
+# Sanity check after launch: GPTQ Phase 1 should print "28 layers, 7 linears each" with NO
+# flash-linear-attention warning. If you see that warning, you launched on the wrong model.
 ```
 
 ## GPU Memory Requirements
@@ -34,11 +45,11 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 
 | Model | Teacher | Quantizer | Total VRAM | Minimum GPU | Cost |
 |---|---|---|---|---|---|
-| Qwen3.5-2B | BF16 (3.8 GB) | ProgressiveQuantized | ~40 GB | 1x A40 48GB | ~$0.40/hr |
-| Qwen3-8B | 4-bit NF4 (6.4 GB) | BitLinear | ~78 GB peak/GPU | 2x A100 80GB | ~$3/hr |
-| Qwen3-8B | 4-bit NF4 | BitLinear (single GPU) | ~85 GB peak | 1x H100 96GB | ~$4/hr |
+| Qwen3-1.7B (dense) | 4-bit NF4 (1.3 GB) | SVIDBitLinear | ~20-30 GB peak | 1x A40 48GB | ~$0.40/hr |
+| Qwen3-8B | 4-bit NF4 (6.4 GB) | SVIDBitLinear | ~78 GB peak/GPU | 2x A100 80GB | ~$3/hr |
+| Qwen3-8B | 4-bit NF4 | SVIDBitLinear (single GPU) | ~85 GB peak | 1x H100 96GB | ~$4/hr |
 
-**Will NOT fit on 24GB GPUs** (RTX 3090/4090) — even the 2B model needs ~40 GB.
+**Will NOT fit on 24GB GPUs** (RTX 3090/4090).
 
 **Will NOT fit on 1x A100 80GB** for 8B — student alone peaks at ~78 GB, teacher needs ~6 GB more.
 
@@ -164,20 +175,41 @@ Research agent audited OneBit's GitHub codebase, found 5 critical missing featur
 - Faster initial pkd drop (3x faster to pkd~26) but plateaued at SAME level as v8
 - More data alone doesn't break through. Either need more compute OR different approach.
 
-### v10 run in progress (2026-04-07) — 2B proof of concept
-- Same v8 architecture on Qwen3.5-2B (~10x faster training, ~2 days for 50k steps)
-- Tests if architecture works on smaller model before investing in more 8B compute
-- Hardware can be downsized to 1x A40 48GB (~$0.40/hr vs $3/hr current)
-- Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3.5-2b/tensorboard --bind_all`
+### v10 first attempt (ABORTED 2026-04-07) — Wrong architecture
+- Launched on Qwen3.5-2B without checking the model config first
+- Killed during GPTQ Phase 1 once we noticed the `flash-linear-attention` warning
+- Qwen3.5-2B is `Qwen3_5ForConditionalGeneration` — multimodal vision-LM with 18/24 text-tower
+  layers as Mamba-style `linear_attention`. Our v8 recipe targets dense `nn.Linear` only;
+  it has no LayerNorm fix for SSM recurrent state. Aborted dir:
+  `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/`. See MODEL CHOICE RULE at top of file.
 
-### Architecture notes for Qwen3/Qwen3.5
+### v10 run in progress (2026-04-07) — Qwen3-1.7B dense proof of concept
+- Same v8 architecture on Qwen3-1.7B (~5x faster training than 8B)
+- True dense twin of Qwen3-8B: same family (`Qwen3ForCausalLM`), same tokenizer (vocab 151936),
+  28 dense layers, full attention every layer, no SSM/MoE/vision
+- Tests if architecture works on a smaller dense model before investing in more 8B compute
+- Fits on 1x A40 48GB (~$0.40/hr vs $3/hr for 2x A100 80GB)
+- Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3-1.7b/tensorboard --bind_all`
+
+### Architecture notes for Qwen3 vs Qwen3.5
+**Qwen3 (dense, supported):**
 - `model.embed_tokens`: Embedding (NOT nn.Linear) — skip automatically
 - `lm_head`: Linear — skip explicitly
-- Qwen3-8B has 252 quantizable linear layers + 1 skipped (lm_head)
-- `in_proj_qkv`: Fused QKV projection, shape [6144, 2048] for 2B
-- `in_proj_a`, `in_proj_b`: Small projections [16, 2048] (Qwen3.5 only)
-- `linear_attn`: Qwen3_5GatedDeltaNet (Qwen3.5 custom attention, NOT in Qwen3)
-- Qwen3-8B is a standard dense transformer — no hybrid attention
+- Qwen3-8B has 252 quantizable linear layers (28 layers × 9 minus skips)
+- Qwen3-1.7B has 28 layers with 7 linears each (q/k/v/o + gate/up/down)
+- Standard dense transformer, full attention every layer, no hybrid blocks
+
+**Qwen3.5 (hybrid multimodal — DO NOT USE with this recipe):**
+- `Qwen3_5ForConditionalGeneration` — multimodal vision-LM
+- `vision_config` (vision tower with patch embeddings, image/video tokens)
+- `mtp_num_hidden_layers: 1` — multi-token prediction head
+- `layer_types`: text-tower has interleaved `linear_attention` (Mamba) and `full_attention`
+  (e.g. 2B is 18/24 linear-attention, 6/24 full attention)
+- `linear_conv_kernel_dim`, `mamba_ssm_dtype`, `linear_key_head_dim`, `linear_num_value_heads` —
+  SSM dynamics that the LayerNorm-after-binary fix does not address
+- `linear_attn`: Qwen3_5GatedDeltaNet (custom Mamba-style attention, NOT in Qwen3)
+- Vocab 248320 (different tokenizer from Qwen3-8B's 151936)
+- The `flash-linear-attention` / `causal-conv1d` warning at load time is the giveaway
 
 ### PrismML Bonsai (for reference)
 - True binary {-d, +d}, NOT ternary

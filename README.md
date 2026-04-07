@@ -6,22 +6,24 @@ Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), w
 
 ## Status
 
-**Active: v10 on Qwen3.5-2B (proof of concept).** v8 proved the OneBit architecture works on 8B (first ever content tokens + correct factual answer at 1-bit), but score plateaued at 1/8. v9 attempted data fix on 8B but plateaued at same level after 400 steps. Pivoted to v10 on smaller Qwen3.5-2B (~10x faster training) with same architecture. The question: does this approach scale down to a smaller model? If 2B reaches 4/8+, architecture is right and 8B just needs more compute. If 2B also caps at 1/8, the architecture has fundamental limits and we need a different approach (synthetic data from teacher).
+**Active: v10 on Qwen3-1.7B (dense proof of concept).** v8 proved the OneBit architecture works on 8B (first ever content tokens + correct factual answer at 1-bit), but score plateaued at 1/8. v9 attempted data fix on 8B but plateaued at same level after 400 steps. v10's first attempt was launched on **Qwen3.5-2B** but immediately killed — **Qwen3.5-2B is a multimodal vision-LM hybrid** (`Qwen3_5ForConditionalGeneration`, vision tower, MTP head, 18/24 text-tower layers are Mamba-style `linear_attention`). Our v8 recipe is built for dense `nn.Linear` stacks and does not transfer to SSM/linear-attention/multimodal layers. v10 was relaunched on **Qwen3-1.7B**, the true dense twin of Qwen3-8B (same family, `Qwen3ForCausalLM`, full attention every layer, vocab 151936, ~5x smaller than 8B). The question: does this approach scale down to a smaller dense model? If 1.7B reaches 4/8+, architecture is right and 8B just needs more compute. If 1.7B also caps at 1/8, the architecture has fundamental limits and we need a different approach (synthetic data from teacher).
+
+> ⚠️ **MODEL CHOICE RULE:** Only dense Qwen3 models work with this recipe — `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen3-4B`, `Qwen3-8B`. **NEVER use anything from the Qwen3.5 family.** Verify before launch: `model_type: qwen3` (not `qwen3_5`) and `architectures: ["Qwen3ForCausalLM"]` (not `Qwen3_5ForConditionalGeneration`). The `flash-linear-attention` / `causal-conv1d` warning at load time is the giveaway you're on a hybrid model — abort.
 
 ## Quick Start — Training
 
 ```bash
 # Install dependencies
-pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf
+pip install torch transformers datasets accelerate bitsandbytes sentencepiece protobuf scikit-learn tensorboard
 
-# 2B model — CURRENT (v10: proof of concept on smaller model)
+# 1.7B dense model — CURRENT (v10: proof of concept on smaller dense model)
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   python3 quantize/run_v5.py \
-    --model Qwen/Qwen3.5-2B --use-4bit-teacher --max-steps 50000 \
+    --model Qwen/Qwen3-1.7B --use-4bit-teacher --max-steps 50000 \
     --max-examples 10000 --epochs 100 --lr 1e-4 \
     --qa-ratio 0.8 \
     --gen-check-interval 500 --eval-interval 2000 \
-    --output-dir quantize/runs/v10-qwen3.5-2b \
+    --output-dir quantize/runs/v10-qwen3-1.7b \
     --use-svid --simple-loss \
     --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
     2>&1 | tee run_v10.log
@@ -30,13 +32,14 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 # Add --model Qwen/Qwen3-8B --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint
 # Change output-dir to quantize/runs/v10-qwen3-8b (or similar)
 
-# First run (no GPTQ checkpoint yet — runs Phase 1 first, ~15 min):
+# First run (no GPTQ checkpoint yet — runs Phase 1 first, ~3 min on 1.7B):
 # Remove --skip-gptq and --gptq-checkpoint flags
 
 # Previous approaches (all failed — see Findings):
 # v4.3: python3 quantize/run_v4.py (loss converges, gen collapses)
 # v5.0: GPTQ binary init (flat gradient landscape)
 # v5.1: on-policy OOM'd (student on single GPU)
+# v10 first attempt: Qwen3.5-2B — wrong architecture (hybrid multimodal)
 ```
 
 ## Quick Start — Running Bonsai (PrismML's pre-built 1-bit models)
@@ -107,10 +110,10 @@ Measured from actual training runs (teacher + student + optimizer + gradients + 
 
 | Model | Config | Total VRAM | Example GPU | Verified |
 |---|---|---|---|---|
-| Qwen3.5-2B | BF16 teacher + ProgressiveQuantized student | ~40 GB | A40 48GB | Yes |
+| Qwen3-1.7B (dense) | 4-bit teacher + SVIDBitLinear student (v10) | ~20-30 GB peak | 1x A40 48GB | Yes (v10) |
 | Qwen3-8B | 4-bit teacher + split student (v5.3) | ~50-60 GB peak/GPU | 2x A100 80GB | Yes (v5.3) |
 | Qwen3-8B | 4-bit teacher + student single GPU + on-policy | ~84 GB peak | OOM on 80GB | Yes (v5.1 OOM) |
-| Qwen3.5-35B | 4-bit teacher + student | ~380 GB | 8x A100 80GB | Estimated |
+| Qwen3-32B (estimate) | 4-bit teacher + student | ~380 GB | 8x A100 80GB | Estimated |
 
 **Split student across both GPUs (v5.3 layout):** Student layers 0-17 on GPU 0 (shared with teacher), layers 18-35 on GPU 1. Peak ~56 GB per GPU. Required for on-policy distillation (2 forward passes per step).
 
@@ -255,13 +258,43 @@ Implements ALL 5 fixes found by auditing OneBit's actual codebase (github.com/xu
 - **Score stuck at 1/8 from step 2000 to 4250** — architecture works but data insufficient
 - **Architecture PROVEN:** LayerNorm prevents generation collapse. Killed to start v9 with more data.
 
-### v9 Run (In Progress — 2026-04-06) — Data Repetition Fix
+### v9 Run (killed step 400 — 2026-04-06) — Same plateau on 8B
 - **Same architecture as v8** (proven: LayerNorm + tanh-STE + NMF + SVID + all-layer alignment)
 - **80% QA ratio** (was 13%) — QA data repeated to fill training mix
 - **50k steps** (was 10k), 10k examples × 100 epochs
-- Each QA pair seen **~2,500 times** (vs v8's ~50, vs OneBit's 1000)
+- Faster initial pkd drop (3x faster to pkd~26 than v8) but plateaued at SAME level (~26)
+- Killed because more data alone didn't break through the v8 plateau
+- Forced the choice: smaller-model proof of concept OR pivot to teacher-generated synthetic data
+
+### v10 first attempt (ABORTED 2026-04-07 before training) — Wrong architecture
+- Launched on `Qwen/Qwen3.5-2B` without checking the model config first
+- **What Qwen3.5-2B actually is:** `Qwen3_5ForConditionalGeneration` — a multimodal vision-LM
+  with `vision_config`, `image_token_id`, `video_token_id`, MTP head, vocab 248320, and
+  text-tower `layer_types` showing 18/24 layers as `linear_attention` (Mamba-style with
+  `linear_conv_kernel_dim`, `mamba_ssm_dtype`, key/value head dims). Only 6/24 layers are
+  `full_attention`. Loading it triggered a `flash-linear-attention` / `causal-conv1d` warning
+  — the giveaway you're on a hybrid model.
+- **Why our recipe fails on it:** SVIDBitLinear targets `nn.Linear`, but in linear-attention
+  layers the linears feed into recurrent SSM state where the LayerNorm-after-binary fix doesn't
+  apply (error compounds through the state, not through stacked dense projections). All-layer
+  directional alignment assumes uniform dense block semantics. MTP head, vision tower, and
+  router/gate weights are outside the recipe entirely.
+- **Killed during GPTQ Phase 1.** Aborted dir: `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/`.
+- **Lesson encoded as the MODEL CHOICE RULE at the top of this README** — never use Qwen3.5
+  family; always verify `model_type: qwen3` and `Qwen3ForCausalLM` before launch.
+
+### v10 Run (In Progress — 2026-04-07) — Qwen3-1.7B dense proof of concept
+- **Relaunched on Qwen3-1.7B**, the true dense architectural twin of Qwen3-8B
+  (`Qwen3ForCausalLM`, `model_type: qwen3`, 28 dense layers, hidden 2048, full attention every
+  layer, vocab 151936 — same tokenizer as Qwen3-8B, no vision, no SSM, no MoE)
+- **Same v8 architecture**: LayerNorm + tanh-STE + NMF + SVID + all-layer alignment
+- **Same v9 data strategy**: 80% QA, 50k steps, 10k examples × 100 epochs
+- **~5x smaller than 8B** → ~5x faster training, fits on a single A40 48GB (~$0.40/hr vs $3/hr)
+- GPTQ Phase 1 finished in ~3 min (28 layers × 7 linears each, no warnings)
 - Tensorboard active, checkpoints every 500 steps with crash recovery
-- Tests the hypothesis: v8's 1/8 score was data-limited, not architecture-limited
+- **Scientific question:** Does the v8 architecture work AT ALL on a smaller dense model?
+  - If 1.7B reaches ≥4/8 → architecture is correct, 8B just needs more compute
+  - If 1.7B also caps at 1/8 → fundamental architecture limit, pivot to teacher synthetic data
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.
