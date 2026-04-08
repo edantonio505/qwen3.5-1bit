@@ -2,16 +2,32 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> 📋 **For resuming on a new server / new Claude Code session**: read **`HANDOFF.md`** first.
+> It is the canonical, self-contained briefing that travels with the git repo. This CLAUDE.md
+> has the detailed history; HANDOFF.md has the actionable resume plan and the v11 launch
+> checklist.
+
 ## ⚡ CURRENT STATE — READ THIS FIRST (2026-04-07)
 
-**🎉🎉🎉 BREAKTHROUGH GROWING: v10 on Qwen3-1.7B reached 6/8 = 75% at step 10000.**
-- Step 6000: 4/8 = 50% (first breakthrough)
-- **Step 10000: 6/8 = 75%** (new best — added Pacific Ocean and 1945 to the HITs)
-- 6x improvement over v8's best (1/8). 50% better than the step 6000 result.
-- Best checkpoint at `quantize/runs/v10-qwen3-1.7b/best/` (auto-updated to step 10000).
-- Run still ongoing (50k steps planned, ~20% through). Check `run_v10_resumed.log`.
-- **8/8 = 100% on this internal eval is no longer impossible.** Two remaining misses are
-  arithmetic (144/12) and a calibration issue (102°C off by 2 from 100°C).
+**🏆 v10 FINAL RESULT: 6/8 = 75% at step 10000 on Qwen3-1.7B (1-bit).** Run was killed at
+step ~18900 after 3 consecutive evals trended DOWN (10000=6/8 → 16000=5/8 → 18000=4/8) due
+to overfitting. Best checkpoint preserved at `quantize/runs/v10-qwen3-1.7b/best/` —
+**3.4 GB safetensors, project's all-time best 1-bit checkpoint, do NOT delete**.
+
+**Score progression and the regression cliff (the most important finding of v10):**
+- Step 2000: 0/8 = 0% (still gibberish)
+- Step 6000: **4/8 = 50%** (first breakthrough; HITs: Paris, 4, Shakespeare, Au)
+- Step 10000: **6/8 = 75% (PEAK)** — added Pacific, 1945
+- Step 16000: 5/8 = 62% (LOST 1945 → "August945")
+- Step 18000: 4/8 = 50% (LOST Pacific → "Oceans")
+- Trend: monotonic regression while pkd kept dropping (8.0 → 7.4)
+
+**The lesson (CRITICAL for the eventual 8B run): score peaks before pkd does.** v10
+overfit to terse single-token answer style after the score peak, producing the cleanest
+"Paris" / "4" answers in project history but losing the multi-token answers (Pacific,
+1945, 100°C). pkd kept dropping the whole way down, so loss-only stopping criteria are
+useless. **Future runs MUST add early-stopping based on eval score**, not loss/pkd. Stop
+when N consecutive evals fail to beat the best (recommended N=2-3).
 
 > ⚠️ **MODEL CHOICE RULE — read before changing `--model`:**
 > Only use **dense Qwen3** models: `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen3-4B`, `Qwen3-8B`.
@@ -23,18 +39,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > and `architectures: ["Qwen3ForCausalLM"]`. The `flash-linear-attention` /
 > `causal-conv1d` warning at load time is a giveaway you're on a hybrid model — abort.
 
-**v10 step 10000 eval — the current best (6/8 = 75%):**
+**v10 PEAK (step 10000, 6/8 = 75% — preserved as best checkpoint):**
 
 | # | Question | Answer | Verdict | Notes |
 |---|---|---|---|---|
-| 1 | Capital of France? | "**Paris**, Paris is Spain (France) Germany)..." | HIT | Now leads with Paris (was buried in a list at step 6000) |
+| 1 | Capital of France? | "**Paris**, Paris is Spain (France) Germany)..." | HIT | Leads with Paris |
 | 2 | 2 + 2 = ? | "**40**" | HIT | Marginal — leading "4" |
 | 3 | Largest ocean? | "Oceans Ocean (**Pacific** Asia)..." | **HIT** | NEW vs step 6000 (was "Mountile") |
 | 4 | 144 / 12? | "80%" | MISS | Arithmetic — model can't compute |
 | 5 | Who wrote Hamlet? | "**Shakespeare**, the Shakespeare's 'Hammer'..." | HIT | Clean retrieval |
-| 6 | Chemical symbol for gold? | "Gold is **Au** (Iron) 1023)..." | HIT | "Gold is Au" structure now |
+| 6 | Chemical symbol for gold? | "Gold is **Au** (Iron) 1023)..." | HIT | "Gold is Au" structure |
 | 7 | Year WW2 ended? | "**1945**, 60s** (World War)..." | **HIT** | NEW vs step 6000 (was "1960s") |
-| 8 | Boiling point of water? | "102°C" | MISS | Off by exactly 2 — calibration, not knowledge |
+| 8 | Boiling point of water? | "102°C" | MISS | Off by 2 — calibration, not knowledge |
+
+**v10 FINAL EVAL (step 18000, 4/8 = 50% — REGRESSION):**
+
+| # | Question | Step 10000 (peak) | Step 18000 (final) | Δ |
+|---|---|---|---|---|
+| 1 | France | "Paris, Paris is Spain..." HIT | **"Paris"** HIT | **CLEANER** ✓ |
+| 2 | 2+2 | "40" HIT (marginal) | **"4"** HIT | **CLEANER** ✓ |
+| 3 | Ocean | "Pacific..." HIT | "Oceans" MISS | **LOST** ✗ |
+| 4 | 144/12 | "80%" MISS | "8" MISS | Same |
+| 5 | Hamlet | "Shakespeare..." HIT | "Shakespeare..." HIT | Same ✓ |
+| 6 | Gold | "Au..." HIT | "Au₂" HIT | Same ✓ |
+| 7 | WW2 | "1945" HIT | "August945" MISS | **LOST** ✗ |
+| 8 | Boiling | "102°C" MISS | "10°C" MISS | Worse (off by 90 instead of 2) |
+
+**The model overfit to terse single-token style.** France→"Paris" and 2+2→"4" became
+the cleanest answers in project history, but multi-token answers (Pacific Ocean, 1945,
+100°C precision) were sacrificed. The model traded breadth for depth.
 
 **v10 step 6000 eval (the first breakthrough, for reference):**
 - France: "Madrid, **Paris** and gentlemen..." HIT (marginal — Paris embedded)
@@ -47,15 +80,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Boiling: "102°C..." MISS
 - **Score: 4/8 = 50%**
 
-**Score progression: 4/8 (step 6000) → 6/8 (step 10000).** The two new HITs (Pacific Ocean,
-1945) were both completely wrong at step 6000 and became correct by step 10000. This is the
-first evidence in the project of *new* facts being learned through continued training, not
-just refinement of existing ones.
+**Score progression (full v10 history):** 0/8 (step 2000) → 4/8 (step 6000) → 6/8 (step 10000,
+PEAK) → 5/8 (step 16000) → 4/8 (step 18000, killed). The two new HITs at step 10000 (Pacific
+Ocean, 1945) were both completely wrong at step 6000 — the first evidence in this project of
+new facts being learned through continued training. Then at step 16000 and 18000, those same
+two new facts were LOST as the model overfit to single-token answer style.
 
-**pkd at step 10000: ~8.0** (vs step 6000: 9.2, vs v8 plateau: 15.5). pkd descent has slowed
-to ~-0.25/1000 steps but **the score-vs-pkd relationship is non-linear**: a 1.2-point pkd
-improvement (9.2 → 8.0) yielded 50% more correct answers. Crossing pkd thresholds appears to
-unlock discrete capability gains.
+**pkd-vs-score divergence (CRITICAL FINDING):** pkd kept dropping the entire time — 9.2 (step
+6000) → 8.0 (step 10000) → 7.5 (step 16000) → 7.4 (step 18000). The loss function indicated
+"still improving" but the score peaked at step 10000 and then decayed. **Loss/pkd is not a
+reliable proxy for benchmark score in this regime.** This is the most important practical
+finding from v10 and dictates how future runs (especially the 8B return-trip) must be
+controlled — see early stopping section below.
 
 **Qualitative pattern (new finding):** Between step 6000 and step 10000, the model went
 through a *phase transition* in answer style. At step 6000, answers were embedded in long
@@ -81,7 +117,7 @@ to count correct content as HITs. **This is a phase v8 never reached on 8B.**
    multimodal vision-LM hybrid with linear-attention layers — wrong architecture for our recipe.
    Killed before significant compute was wasted. Aborted dir:
    `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/`.
-5. **v10 (BREAKTHROUGH, still running)**: Relaunched on **Qwen3-1.7B** (true dense twin of 8B).
+5. **v10 (BREAKTHROUGH, killed at step ~18900)**: Relaunched on **Qwen3-1.7B** (true dense twin of 8B).
    Same v8 architecture, same v9 data strategy. **Hit 4/8 = 50% at step 6000, then 6/8 = 75% at
    step 10000.** pkd plummeted from 65→8.0 (vs v8's 15.5 plateau). The scientific question is
    settled: **the v8 architecture works AND the 1/8 ceiling on 8B was compute-limited, not
@@ -94,28 +130,57 @@ to count correct content as HITs. **This is a phase v8 never reached on 8B.**
    rotation to `run_v5.py` (delete oldest before each save) to cap disk usage at 2 checkpoints
    (~14 GB) and prevent recurrence.
 
-**What to do next when v10 finishes (or if it crashes):**
-- Check `tail -30 run_v10_resumed.log` for current step + score
-- v10 already cleared the ≥4/8 bar at step 6000 — architecture is **definitively proven**
-- **If score continues climbing past 6000**: keep running. The next decision points are step
-  10000 (expected 5-6/8), step 20000 (expected 6-7/8), step 50000 (asymptote). When score
-  flatlines for ~10000 steps, that's the natural stopping point.
-- **When v10 finishes (or before, if confident):** return to **Qwen3-8B with the same v8
-  architecture + 80% QA + 50k+ steps**. Now that the architecture is proven AND the pkd
-  ceiling is provably compute-limited, 8B with sufficient compute should produce a real
-  Bonsai-class result (target: PrismML's 70.5% avg benchmark).
-- If v10 crashes: resume with `--resume-from quantize/runs/v10-qwen3-1.7b/checkpoint-XXXX`
-  (checkpoints save every 500 steps with full optimizer state, rotation keeps last 2 only)
+**What to do next (v10 is DONE, killed at step ~18900 after regression):**
+- v10's best result is 6/8 = 75% at step 10000, preserved at `quantize/runs/v10-qwen3-1.7b/best/`.
+  This is the project's all-time best 1-bit checkpoint. **Do NOT delete.**
+- **The clear next step is the 8B return-trip (v11):** launch Qwen3-8B with the same v10
+  recipe + a few critical improvements informed by what v10 taught us. The architecture is
+  proven; 8B with sufficient training should hit Bonsai-class numbers (PrismML's 70.5%).
+
+**Required improvements before launching v11 (8B):**
+1. **ADD EARLY STOPPING by eval score** (not pkd/loss). v10 overfit past its peak score.
+   For v11: track best eval score, save best checkpoint (already in code), and STOP the
+   run if 2-3 consecutive evals fail to beat the best. Without this, v11 will waste compute
+   training past its peak.
+2. **EXPAND the eval set.** 8 hand-picked questions is too few — too noisy to detect peak
+   reliably. Add 50-100 questions from MMLU-mini, TriviaQA-easy, GSM8K-elementary so the
+   score signal is stable across single-question fluctuations.
+3. **Verify disk quota** on the new 2x A100 pod with `dd if=/dev/zero of=test.bin bs=1M
+   count=8192 conv=fsync` BEFORE launching. Different pods have different quotas; v10
+   crashed on a quota truncation that took us hours to diagnose.
+4. **Pre-write the checkpoint rotation logic** (already in run_v5.py:1294-1308 — verify it's
+   still there before launch).
+
+**Launch command for v11 (8B return-trip), after improvements above:**
+```bash
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup \
+  python3 quantize/run_v5.py \
+    --model Qwen/Qwen3-8B --use-4bit-teacher --max-steps 50000 \
+    --max-examples 10000 --epochs 100 --lr 1e-4 --qa-ratio 0.8 \
+    --gen-check-interval 500 --eval-interval 2000 \
+    --output-dir quantize/runs/v11-qwen3-8b \
+    --skip-gptq --gptq-checkpoint quantize/runs/v5-qwen3-8b/gptq_checkpoint \
+    --use-svid --simple-loss \
+    --on-policy-fraction 0.15 --on-policy-len 32 --ste-clip 0 --unlikelihood-weight 0 \
+    > run_v11.log 2>&1 &
+```
+
+**After v11 produces a high-scoring 8B checkpoint:**
+- Run real benchmarks via `lm-evaluation-harness` (MMLU, ARC, GSM8K, TruthfulQA, HellaSwag)
+- Export to Q1_0_g128 GGUF via `quantize/export_gguf.py`
+- Compare side-by-side against PrismML's Bonsai-8B (70.5% avg target)
 
 **Key files to know:**
+- **`HANDOFF.md` — canonical resume document for new servers / new Claude sessions** ⭐
 - `quantize/run_v5.py` — Main training script (despite name, has v8 architecture inside)
 - `quantize/gptq_1bit.py` — GPTQ Phase 1 calibration
 - `quantize/diagnose.py` — Logit ranking diagnostic (run on saved checkpoint)
 - `run_v10.log` — First v10 run (steps 1-3500, killed by disk quota at checkpoint write)
-- `run_v10_resumed.log` — Current run (resumed from checkpoint-3000, hit 4/8 at step 6000)
-- `quantize/runs/v10-qwen3-1.7b/` — Current run output dir
-- **`quantize/runs/v10-qwen3-1.7b/best/` — 🏆 First 4/8 = 50% checkpoint (3.4 GB safetensors).
-  Do NOT delete. This is the project's best result so far.**
+- `run_v10_resumed.log` — Resumed run (checkpoint-3000 → ~step 18900, killed after regression)
+- `quantize/runs/v10-qwen3-1.7b/` — v10 output dir
+- **`quantize/runs/v10-qwen3-1.7b/best/` — 🏆 6/8 = 75% checkpoint (3.4 GB safetensors).
+  Project's all-time best 1-bit checkpoint. NOT in git — local to this pod only.
+  Back it up before tearing down the pod (see HANDOFF.md "Checkpoint persistence").**
 - `quantize/runs/v10-qwen3-1.7b/gptq_checkpoint/` — 1.7B GPTQ Phase 1 checkpoint (skip with `--skip-gptq` to save 3 min)
 - `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/` — Aborted first v10 attempt (wrong arch)
 - `quantize/runs/v5-qwen3-8b/gptq_checkpoint/` — Reusable 8B GPTQ checkpoint (if returning to 8B)
@@ -139,6 +204,12 @@ you need 2x A100 80GB.
    on `/workspace` (FUSE/MooseFS) silently truncates 4 GB checkpoint writes mid-flight.
 10. Tensorboard logging built in (--logdir runs/<run>/tensorboard)
 11. NEVER use ternary {-1,0,+1} — must be true binary {-1,+1} like Bonsai
+12. **NEEDS ADDING (not yet in code): early stopping based on EVAL SCORE, not loss/pkd.**
+    v10 demonstrated that pkd kept improving while the eval score regressed (6/8 → 5/8 → 4/8)
+    due to overfitting to terse answer style. For future runs: stop if N consecutive evals
+    fail to beat best (recommended N=2-3). Without this, runs will overfit past their peak
+    and waste compute / produce worse final checkpoints. The "best" checkpoint logic (already
+    in code) preserves the peak, but doesn't stop the run from continuing to degrade.
 
 **Disk/quota gotcha (learned the hard way):** `/workspace` is a FUSE-mounted MooseFS network
 volume on RunPod with a per-tenant quota (~50 GB on this pod). Each checkpoint = ~7 GB. Without
@@ -396,7 +467,7 @@ v10 first attempt (ABORTED 2026-04-07, before training started) — Qwen/Qwen3.5
   layers where error compounds through recurrent state. Aborted dir:
   `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/`. See MODEL CHOICE RULE at top of file.
 
-v10 (BREAKTHROUGH, still running) — Qwen3-1.7B + v8 architecture + 80% QA:
+v10 (BREAKTHROUGH + KILLED at step ~18900) — Qwen3-1.7B + v8 architecture + 80% QA:
 - **Same architecture as v8**: LayerNorm + tanh-STE + NMF + SVID + all-layer alignment
 - **Same data strategy as v9**: 80% QA, 50k steps, 10k examples × 100 epochs
 - **Same family as 8B**: `Qwen3ForCausalLM`, `model_type: qwen3`, 28 dense layers, hidden 2048,
@@ -418,13 +489,15 @@ v10 (BREAKTHROUGH, still running) — Qwen3-1.7B + v8 architecture + 80% QA:
 | 8000 | ~8.5 | |
 | **10000** | **~8.0** | 48% below v8 plateau (second eval breakthrough) |
 
-**Eval score progression:**
+**Eval score progression (full):**
 
-| Step | Score | New HITs vs prior | Notes |
-|------|-------|-------------------|-------|
+| Step | Score | Change | Notes |
+|------|-------|--------|-------|
 | 2000 | 0/8 | — | Still gibberish content |
-| 6000 | **4/8 = 50%** | Paris(marg), 4(marg), Shakespeare, Au | First breakthrough |
-| **10000** | **6/8 = 75%** | + Pacific, + 1945 | Current best, **6x v8's best** |
+| 6000 | **4/8 = 50%** | + Paris(marg), 4(marg), Shakespeare, Au | First breakthrough |
+| **10000** | **6/8 = 75%** | **+ Pacific, + 1945** | **PEAK — best checkpoint saved** |
+| 16000 | 5/8 = 62% | − 1945 ("August945") | Regression begins |
+| 18000 | 4/8 = 50% | − Pacific ("Oceans") | Killed shortly after at ~step 18900 |
 
 **The two persistent MISSes at step 10000:**
 - **144/12** requires arithmetic, not retrieval. May not be fixable at 1-bit 1.7B.
@@ -451,17 +524,20 @@ to step 10000 = 6/8). This is the project's high-water mark. **Do NOT delete.**
 **Hardware:** 1x A40 48GB (~$0.40/hr) vs 2x A100 80GB (~$3/hr). ~85% cost savings.
 Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3-1.7b/tensorboard --bind_all`
 
-**Updated predictions for the rest of the run:**
+**Predictions vs reality (a humbling lesson):**
 
-| Step | Predicted score | Confidence |
-|------|---|---|
-| 12000 (next eval) | 6/8 confirmed, possibly 7/8 | High |
-| 20000 | 6-7/8 | High |
-| 30000 | 7/8 likely | Medium |
-| 50000 | 7-8/8 conceivable | Medium-Low |
+| Step | I predicted | Actual | What I missed |
+|------|---|---|---|
+| 12000 | 6/8 confirmed, possibly 7/8 | (skipped) | — |
+| 16000 | — | **5/8** | Score regression had already begun |
+| 18000 | — | **4/8** | Overfitting cliff |
 
-**8/8 = 100% on this internal eval is no longer impossible.** The arithmetic miss may stay,
-but the calibration miss (102°C) is plausibly fixable with more training.
+**The lesson I should have caught earlier:** when pkd descent flattens but the gen check
+shows the model "committing harder" to a particular answer style, that's an OVERFITTING
+signal, not a refinement signal. The phase transition to terse answers (which I called
+"positive" at the time) was actually the leading edge of capability collapse on multi-token
+recall. Future predictions should weight gen-check style trends as warning signs, not
+victories, when pkd is no longer dropping fast.
 
 **v5 approach: GPTQ init + on-policy distillation + unlikelihood + clipped STE:**
 

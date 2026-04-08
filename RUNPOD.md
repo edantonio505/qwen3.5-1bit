@@ -1,13 +1,14 @@
 # RunPod Setup — Qwen 1-bit QAT
 
-> 🎉🎉 **v10 BREAKTHROUGH GROWING (2026-04-07):** The v8 architecture + 80% QA + 50k-step
-> recipe on Qwen3-1.7B reached **6/8 = 75% accuracy** on the factual eval at step 10000.
-> Six correct factual answers: Paris, 4, Pacific, Shakespeare, Au, 1945. pkd dropped from
-> 65 → 8.0, blowing past v8's plateau of 15.5. **6x improvement over v8's previous best
-> (1/8) on a smaller model.** Continued training added NEW facts (Pacific, 1945 were both
-> wrong at step 6000, correct by step 10000). Best checkpoint at
-> `quantize/runs/v10-qwen3-1.7b/best/`. See `CLAUDE.md` for the full v10 results and the
-> qualitative phase-transition analysis.
+> 🏆 **v10 FINAL (2026-04-07):** The v8 architecture + 80% QA + 50k-step recipe on
+> Qwen3-1.7B PEAKED at **6/8 = 75% accuracy** on the factual eval at step 10000 — six
+> correct factual answers (Paris, 4, Pacific, Shakespeare, Au, 1945). 6x v8's previous
+> best on a smaller model. Run was killed at ~step 18900 after the score regressed for
+> two consecutive evals (10000=6/8 → 16000=5/8 → 18000=4/8) due to overfitting to
+> single-token answer style. **Critical lesson: pkd kept dropping while score regressed
+> — loss-only stopping is useless. Future runs need early stopping based on eval score.**
+> Best checkpoint preserved at `quantize/runs/v10-qwen3-1.7b/best/`. See `CLAUDE.md` for
+> the full v10 results, the regression cliff analysis, and the v11 (8B) launch checklist.
 
 > ⚠️ **MODEL CHOICE RULE:** Only dense Qwen3 models work — `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen3-4B`,
 > `Qwen3-8B`. **NEVER use anything from the Qwen3.5 family.** Qwen3.5 is a multimodal hybrid
@@ -200,23 +201,29 @@ Research agent audited OneBit's GitHub codebase, found 5 critical missing featur
   it has no LayerNorm fix for SSM recurrent state. Aborted dir:
   `quantize/runs/v10-qwen3.5-2b-ABORTED-hybrid-arch/`. See MODEL CHOICE RULE at top of file.
 
-### v10 (BREAKTHROUGH GROWING 2026-04-07) — Qwen3-1.7B dense, 6/8 = 75% at step 10000
+### v10 (FINAL 2026-04-07) — Qwen3-1.7B dense, peaked at 6/8 = 75% (step 10000), killed at ~step 18900
 - Same v8 architecture on Qwen3-1.7B (~5x faster training than 8B)
 - True dense twin of Qwen3-8B: same family (`Qwen3ForCausalLM`), same tokenizer (vocab 151936),
   28 dense layers, full attention every layer, no SSM/MoE/vision
 - Survived a checkpoint-write disk-quota crash at step 3500; resumed cleanly from
   checkpoint-3000 with optimizer state preserved. Fixed via checkpoint rotation.
-- **pkd: 65 → 8.0 by step 10000 (vs v8 plateau 15.5 on 8B).**
-- **Eval progression: 0/8 (step 2000) → 4/8 = 50% (step 6000) → 6/8 = 75% (step 10000).**
-  HITs at step 10000: Paris, "4", Pacific, Shakespeare, Au, 1945. MISSes: 144/12 (arithmetic),
-  102°C (off by 2 from 100°C — calibration issue). **6x v8's previous best (1/8) on a smaller
-  model.** Best checkpoint at `quantize/runs/v10-qwen3-1.7b/best/` (3.4 GB safetensors — DO
-  NOT delete).
-- **Phase transition observed:** between steps 6000 and 10000 the gen checks went from
-  rambling-with-content (`"Madrid, Paris and gentlemen..."`) to single-word terminated
-  (`"Paris"`). The model learned to STOP after the answer — a phase v8 never reached on 8B.
-- Continued training adds NEW facts (Pacific, 1945 were wrong at step 6000, correct at 10000).
-- Run continues to 50k steps to find the asymptote on 1.7B
+- **pkd: 65 → 7.4 (still descending when killed). Score: peaked at 6/8 = 75% (step 10000),
+  then regressed to 4/8 by step 18000.**
+- **Eval progression:** 0/8 (step 2000) → 4/8 (step 6000) → **6/8 (step 10000, PEAK)** →
+  5/8 (step 16000) → 4/8 (step 18000, killed). PEAK HITs: Paris, "4", Pacific, Shakespeare,
+  Au, 1945. **6x v8's previous best (1/8) on a smaller model.** Best checkpoint preserved
+  at `quantize/runs/v10-qwen3-1.7b/best/` (3.4 GB safetensors — DO NOT delete).
+- **Phase transition (step 6000 → 10000):** rambling-with-content → single-word terminated
+  answers. v8 never reached this state on 8B. France→"Paris" and 2+2→"4" became the cleanest
+  answers in project history.
+- **Continued training added NEW facts** (Pacific, 1945 went from wrong at step 6000 to
+  correct at step 10000) — first evidence in this project of new facts being learned.
+- **Then OVERFIT past peak (step 10000 → 18000):** the model committed harder to single-token
+  style and LOST the multi-token answers. "Pacific Ocean" became "Oceans"; "1945" became
+  "August945". Score regressed monotonically while pkd kept dropping. **pkd-vs-score
+  divergence is the critical practical finding from v10.**
+- **Lesson encoded for future runs:** add early stopping based on EVAL SCORE, not loss/pkd.
+  Stop if 2-3 consecutive evals fail to beat the best.
 - Fits on 1x A40 48GB (~$0.40/hr vs $3/hr for 2x A100 80GB), peak ~17/33 GB used
 - Tensorboard: `tensorboard --logdir quantize/runs/v10-qwen3-1.7b/tensorboard --bind_all`
 

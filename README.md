@@ -4,24 +4,38 @@ Experimental 1-bit quantization-aware training (QAT) for Qwen language models. T
 
 Inspired by [PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo), which demonstrated that a 1-bit 8B model (1.15 GB) can score competitively against full-precision models (16+ GB). This repo includes PrismML's demo scripts for running their pre-built Bonsai models, plus our own QAT training pipeline.
 
+> **Resuming this work on a new server?** Read **`HANDOFF.md`** first — it's the canonical
+> resume briefing with the v11 launch checklist.
+
 ## Status
 
-**🎉🎉🎉 BREAKTHROUGH GROWING (2026-04-07): v10 on Qwen3-1.7B reached 6/8 = 75% at step 10000.**
-- Step 6000: **4/8 = 50%** (first breakthrough)
-- Step 10000: **6/8 = 75%** (current best)
+**🏆 v10 FINAL RESULT (2026-04-07): 6/8 = 75% on Qwen3-1.7B 1-bit at step 10000.**
+Project's all-time best 1-bit checkpoint. Run was killed at ~step 18900 after the score
+regressed for two consecutive evals (10000=6/8 → 16000=5/8 → 18000=4/8) due to overfitting.
+Best checkpoint preserved at `quantize/runs/v10-qwen3-1.7b/best/`.
 
-Six correct factual answers at 1-bit on a 1.7B parameter model: **Paris** (capital of France),
-**4** (2+2), **Pacific** (largest ocean), **Shakespeare** (wrote Hamlet), **Au** (gold symbol),
-**1945** (WW2 ended). Two persistent misses: **144/12** (arithmetic) and **102°C boiling
-point** (off by 2 — calibration issue, not knowledge).
+**Six correct factual answers** at 1-bit on a 1.7B parameter model:
+- **Paris** (capital of France)
+- **4** (2+2)
+- **Pacific** (largest ocean)
+- **Shakespeare** (wrote Hamlet)
+- **Au** (gold symbol)
+- **1945** (WW2 ended)
 
-This is **6x v8's previous best** (1/8 = 12.5%) on a smaller model. pkd plummeted from 65 → 8.0,
-blowing past v8's plateau of 15.5 on 8B. Between step 6000 and step 10000, the model went
-through a *phase transition* from rambling-with-content to **single-word terminated answers** —
-a qualitative state v8 never reached on 8B.
+Two persistent misses at peak: **144/12** (arithmetic — model can't compute) and
+**102°C boiling point** (off by 2 — calibration, not knowledge).
 
-Best checkpoint saved at `quantize/runs/v10-qwen3-1.7b/best/` (auto-updated to step 10000).
-Run still ongoing (50k steps planned, currently ~20% through).
+This is **6x v8's previous best** (1/8 = 12.5%) on a smaller model. pkd plummeted from
+65 → 8.0, blowing past v8's plateau of 15.5 on 8B. Between step 6000 and step 10000, the
+model went through a phase transition from rambling-with-content to single-word terminated
+answers — a qualitative state v8 never reached on 8B.
+
+**The most important finding from v10 — the regression cliff:** After step 10000, the
+model continued committing harder to terse single-token style. France→"Paris" and 2+2→"4"
+became the cleanest answers in project history, but multi-token answers (Pacific Ocean,
+1945, 100°C precision) were lost as the model overfit. **pkd kept dropping the entire time
+the score was regressing**, meaning loss/pkd is not a reliable proxy for benchmark score in
+this regime. Future runs MUST add early stopping based on eval score, not loss.
 
 **Scientific result:** The v8 architecture (LayerNorm in BitLinear + tanh-STE + NMF init +
 all-layer alignment + LR 1e-4) transfers across model sizes AND produces real factual content
@@ -324,7 +338,7 @@ Implements ALL 5 fixes found by auditing OneBit's actual codebase (github.com/xu
 - **Lesson encoded as the MODEL CHOICE RULE at the top of this README** — never use Qwen3.5
   family; always verify `model_type: qwen3` and `Qwen3ForCausalLM` before launch.
 
-### v10 Run (BREAKTHROUGH GROWING — 2026-04-07) — Qwen3-1.7B dense, hit 6/8 = 75% at step 10000
+### v10 Run (FINAL — 2026-04-07) — Qwen3-1.7B dense, peaked at 6/8 = 75% (step 10000), killed at ~step 18900 due to regression
 - **Relaunched on Qwen3-1.7B**, the true dense architectural twin of Qwen3-8B
   (`Qwen3ForCausalLM`, `model_type: qwen3`, 28 dense layers, hidden 2048, full attention every
   layer, vocab 151936 — same tokenizer as Qwen3-8B, no vision, no SSM, no MoE)
@@ -349,13 +363,15 @@ Implements ALL 5 fixes found by auditing OneBit's actual codebase (github.com/xu
 | 8000 | ~8.5 | |
 | **10000** | **~8.0** | **48% below v8 plateau (second eval breakthrough at 6/8)** |
 
-**Eval score progression:**
+**Eval score progression (full v10 history):**
 
-| Step | Score | New HITs vs prior | Notes |
-|------|-------|-------------------|-------|
+| Step | Score | Change | Notes |
+|------|-------|--------|-------|
 | 2000 | 0/8 | — | Still gibberish |
-| 6000 | **4/8 = 50%** | Paris, 4 (marg), Shakespeare, Au | First breakthrough |
-| **10000** | **6/8 = 75%** | + Pacific, + 1945 | Current best, 6x v8's best |
+| 6000 | **4/8 = 50%** | + Paris, 4 (marg), Shakespeare, Au | First breakthrough |
+| **10000** | **6/8 = 75%** | **+ Pacific, + 1945** | **PEAK — best checkpoint saved** |
+| 16000 | 5/8 = 62% | − 1945 ("August945") | Regression begins |
+| 18000 | 4/8 = 50% | − Pacific ("Oceans") | Killed shortly after (step ~18900) |
 
 **Step 10000 eval (current best — 6/8 = 75%):**
 
@@ -407,19 +423,27 @@ the step-10000 6/8 = 75% checkpoint). Project's high-water mark.
    new HITs that didn't exist at step 6000)
 7. The Bonsai-class target (70.5% avg benchmark) is now conceivable on 8B
 
-**Updated predictions:**
+**Why the run was killed (the regression cliff):**
 
-| Step | Predicted score |
-|------|---|
-| 12000 (next eval) | 6/8 confirmed, possibly 7/8 |
-| 20000 | 6-7/8 |
-| 30000 | 7/8 likely |
-| 50000 | 7-8/8 conceivable (8/8 only blocked by arithmetic + calibration) |
+After step 10000, the model started overfitting to single-token answer style. France→"Paris"
+and 2+2→"4" became the cleanest answers in project history (perfect single-token outputs).
+But the model traded breadth for depth — it lost the ability to produce multi-token answers.
+By step 18000, "Pacific Ocean" became "Oceans" (lost the key word) and "1945" became
+"August945" (lost the year format). The score went 6/8 → 5/8 → 4/8 over three consecutive
+evals while pkd kept dropping (8.0 → 7.5 → 7.4). **Loss-only stopping criteria are useless
+in this regime — the eval score is the only reliable signal.**
+
+**The lesson encoded for future runs:** Add early stopping based on eval score, not loss/pkd.
+Stop if N consecutive evals fail to beat the best (recommended N=2-3). Without this, runs
+will train past their peak and degrade. The "best" checkpoint logic in `run_v5.py` already
+preserves the peak, but doesn't stop the run from continuing to overfit.
 
 **What's next:**
-- Run continues to find out the asymptote on 1.7B
-- After v10 finishes: return to Qwen3-8B with v10's recipe + more compute. The architecture
-  is now proven; 8B with sufficient training should hit Bonsai-class numbers.
+- v10 is done. Best checkpoint at `quantize/runs/v10-qwen3-1.7b/best/` (6/8 = 75%, 3.4 GB).
+- Next: launch v11 on Qwen3-8B with the same recipe + early-stopping + expanded eval set.
+  The architecture is now thoroughly proven; 8B with sufficient training should hit
+  Bonsai-class numbers (PrismML's 70.5% avg target).
+- See `CLAUDE.md` for the v11 launch checklist and the required code changes.
 
 ### Why This Is Hard
 PrismML's Bonsai uses proprietary Caltech IP (Babak Hassibi, inventor of Optimal Brain Surgeon). Their approach is described as "mathematically grounded advances designed to preserve reasoning quality under aggressive compression." No research paper has been published.
