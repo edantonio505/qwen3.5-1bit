@@ -515,4 +515,4 @@ Required on aarch64 (ARM64) systems — pre-built binaries are x64 only.
 
 ## License
 
-Apache 2.0 (inherited from PrismML's Bonsai-demo).
+MIT
